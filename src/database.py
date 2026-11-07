@@ -1,19 +1,18 @@
 """
 Database module for SQLite with FTS5 and Vector BLOB storage.
-Optimized for ultra-fast hybrid queries (Lexical BM25 + Dense Vectors).
+Optimized for ultra-fast hybrid queries (Lexical BM25 + Two-Phase Dense Vectors).
 """
 import sqlite3
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-from src.config import DB_PATH, DATABASE_DIR
+from src.config import DB_PATH
 
 
 def get_db_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    """Returns a SQLite connection with row factory enabled."""
+    """Returns a SQLite connection with row factory and WAL high-concurrency pragma."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL;")  # High-concurrency Write-Ahead Logging
+    conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA cache_size = -64000;")  # 64MB cache
     conn.execute("PRAGMA foreign_keys = ON;")
@@ -21,7 +20,7 @@ def get_db_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
 
 
 def init_database(db_path: Path = DB_PATH) -> None:
-    """Creates tables, indexes, and FTS5 virtual tables."""
+    """Creates relational tables, indexes, and FTS5 virtual table."""
     conn = get_db_connection(db_path)
     cur = conn.cursor()
 
@@ -95,7 +94,7 @@ def init_database(db_path: Path = DB_PATH) -> None:
     """)
 
     # 6. FTS5 Virtual Table for full-text search with BM25 ranking
-    # Using unicode61 tokenizer with remove_diacritics 2 for perfect Spanish matching
+    # We use rowid directly aligned with chunks.id for fast integer JOINs
     cur.execute("""
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
         chunk_id UNINDEXED,
@@ -122,11 +121,12 @@ def init_database(db_path: Path = DB_PATH) -> None:
     );
     """)
 
-    # Indexes for performance
+    # Performance Indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(document_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_dept ON chunks(department_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_dept ON documents(department_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_date ON documents(date);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_code ON documents(doc_code);")
 
     conn.commit()
     conn.close()

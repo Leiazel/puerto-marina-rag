@@ -1,6 +1,8 @@
 """
-Hybrid Retriever module combining SQLite FTS5 (BM25) and Dense Vector Cosine Similarity
-with Reciprocal Rank Fusion (RRF) and metadata filtering.
+Hybrid Retriever module (v2.0) combining:
+- SQLite FTS5 (BM25) with Spanish Stopword filtering and rowid integer joins.
+- Two-Phase Dense Vector Cosine Similarity (loads only IDs & BLOBs first, then fetches text for Top-K).
+- Reciprocal Rank Fusion (RRF) and metadata filtering.
 """
 import time
 import json
@@ -8,9 +10,21 @@ import sqlite3
 import numpy as np
 from typing import List, Dict, Any, Optional
 
-from src.config import DB_PATH, DEFAULT_TOP_K, DEFAULT_HYBRID_ALPHA, RRF_K_CONSTANT
+from src.config import (
+    DB_PATH,
+    DEFAULT_TOP_K,
+    DEFAULT_HYBRID_ALPHA,
+    RRF_K_CONSTANT,
+    SPANISH_STOPWORDS
+)
 from src.database import get_db_connection
 from src.embeddings import get_embedding_engine
+
+
+import unicodedata
+
+def _strip_accents(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
 
 
 class HybridRetriever:
@@ -20,19 +34,21 @@ class HybridRetriever:
 
     def _clean_fts_query(self, query: str) -> str:
         """
-        Cleans and formats a query string for SQLite FTS5.
-        Removes special symbols and adds prefix matching for Spanish words.
+        Cleans a natural language Spanish query for SQLite FTS5.
+        Strips accents, punctuation, removes Spanish stopwords, and applies prefix wildcards.
         """
-        # Remove characters that cause FTS5 syntax errors: * " ( ) : ^
-        cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in query)
-        words = cleaned.split()
-        if not words:
+        no_accents = _strip_accents(query.lower())
+        cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in no_accents)
+        raw_words = [w for w in cleaned.split() if len(w) >= 2]
+        if not raw_words:
             return ""
-        # Build an OR-based query with prefix wildcards for flexible matching
-        # e.g. "lesion Carrizo" -> "lesion* OR Carrizo*"
-        fts_terms = [f'"{w}"*' for w in words if len(w) > 2]
-        if not fts_terms:
-            fts_terms = [f'"{w}"' for w in words]
+
+        # Filter out Spanish stopwords so BM25 focuses strictly on domain terms
+        meaningful_words = [w for w in raw_words if len(w) > 2 and w not in SPANISH_STOPWORDS]
+        if not meaningful_words:
+            meaningful_words = raw_words
+
+        fts_terms = [f'"{w}"*' for w in meaningful_words]
         return " OR ".join(fts_terms)
 
     def search_lexical(
@@ -40,10 +56,10 @@ class HybridRetriever:
         conn: sqlite3.Connection,
         query: str,
         department_filter: Optional[str] = None,
-        limit: int = 20
+        limit: int = 25
     ) -> List[Dict[str, Any]]:
         """
-        Performs full-text search with BM25 ranking on chunks_fts.
+        Performs full-text search with BM25 ranking on chunks_fts using direct rowid join.
         """
         fts_q = self._clean_fts_query(query)
         if not fts_q:
@@ -61,9 +77,9 @@ class HybridRetriever:
                         c.content,
                         c.metadata_json,
                         bm25(chunks_fts) as bm25_rank,
-                        snippet(chunks_fts, 3, '«', '»', '...', 20) as match_snippet
+                        snippet(chunks_fts, 3, '«', '»', '...', 22) as match_snippet
                     FROM chunks_fts
-                    JOIN chunks c ON c.id = CAST(chunks_fts.chunk_id AS INTEGER)
+                    JOIN chunks c ON c.id = chunks_fts.rowid
                     WHERE chunks_fts MATCH ? AND c.department_id = ?
                     ORDER BY bm25_rank ASC
                     LIMIT ?;
@@ -79,21 +95,19 @@ class HybridRetriever:
                         c.content,
                         c.metadata_json,
                         bm25(chunks_fts) as bm25_rank,
-                        snippet(chunks_fts, 3, '«', '»', '...', 20) as match_snippet
+                        snippet(chunks_fts, 3, '«', '»', '...', 22) as match_snippet
                     FROM chunks_fts
-                    JOIN chunks c ON c.id = CAST(chunks_fts.chunk_id AS INTEGER)
+                    JOIN chunks c ON c.id = chunks_fts.rowid
                     WHERE chunks_fts MATCH ?
                     ORDER BY bm25_rank ASC
                     LIMIT ?;
                 """
                 cur.execute(sql, (fts_q, limit))
-            
+
             rows = cur.fetchall()
             results = []
             for idx, r in enumerate(rows):
-                # SQLite bm25 returns lower numbers for better matches (typically negative)
                 raw_bm25 = float(r["bm25_rank"])
-                # Normalize BM25 into a positive score
                 score = abs(raw_bm25) if raw_bm25 < 0 else (1.0 / (1.0 + raw_bm25))
                 results.append({
                     "chunk_id": r["chunk_id"],
@@ -107,8 +121,7 @@ class HybridRetriever:
                     "lexical_rank": idx + 1
                 })
             return results
-        except sqlite3.OperationalError as e:
-            # Fallback if FTS syntax edge case
+        except sqlite3.OperationalError:
             return []
 
     def search_vector(
@@ -116,69 +129,61 @@ class HybridRetriever:
         conn: sqlite3.Connection,
         query: str,
         department_filter: Optional[str] = None,
-        limit: int = 20
+        limit: int = 25
     ) -> List[Dict[str, Any]]:
         """
-        Performs dense semantic vector search via BLAS dot product over stored BLOBs.
+        Two-Phase Dense Vector Search:
+        Phase 1: Load only (id, embedding) BLOBs and compute BLAS dot product.
+        Phase 2: Fetch full text/metadata ONLY for the top `limit` chunk IDs.
         """
         query_vec = self.embedder.embed_text(query)
         cur = conn.cursor()
 
+        # Phase 1: Lightweight scan of IDs and embedding BLOBs
         if department_filter:
-            cur.execute("""
-                SELECT id, document_id, title, department_id, content, embedding, metadata_json
-                FROM chunks
-                WHERE department_id = ?;
-            """, (department_filter,))
+            cur.execute("SELECT id, embedding FROM chunks WHERE department_id = ?;", (department_filter,))
         else:
-            cur.execute("""
-                SELECT id, document_id, title, department_id, content, embedding, metadata_json
-                FROM chunks;
-            """)
+            cur.execute("SELECT id, embedding FROM chunks;")
 
         rows = cur.fetchall()
         if not rows:
             return []
 
-        chunk_ids = []
-        doc_ids = []
-        titles = []
-        depts = []
-        contents = []
-        metas = []
-        blobs = []
+        chunk_ids = [r["id"] for r in rows]
+        blobs = [r["embedding"] for r in rows]
 
-        for r in rows:
-            chunk_ids.append(r["id"])
-            doc_ids.append(r["document_id"])
-            titles.append(r["title"])
-            depts.append(r["department_id"])
-            contents.append(r["content"])
-            metas.append(r["metadata_json"])
-            blobs.append(r["embedding"])
-
-        # Pack into numpy matrix
         dim = len(query_vec)
         matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(-1, dim)
-
-        # Vectorized cosine similarity
         similarities = self.embedder.compute_cosine_similarity(query_vec, matrix)
 
-        # Get top indices
         top_indices = np.argsort(similarities)[::-1][:limit]
+        winning_ids = [chunk_ids[i] for i in top_indices]
+        sim_by_id = {chunk_ids[i]: float(similarities[i]) for i in top_indices}
+
+        # Phase 2: Fetch text & metadata only for the winning IDs
+        placeholders = ",".join("?" for _ in winning_ids)
+        cur.execute(f"""
+            SELECT id, document_id, title, department_id, content, metadata_json
+            FROM chunks
+            WHERE id IN ({placeholders});
+        """, winning_ids)
+
+        detail_map = {r["id"]: r for r in cur.fetchall()}
 
         results = []
-        for rank, idx in enumerate(top_indices):
-            sim = float(similarities[idx])
+        for rank, cid in enumerate(winning_ids, 1):
+            r = detail_map.get(cid)
+            if not r:
+                continue
             results.append({
-                "chunk_id": chunk_ids[idx],
-                "document_id": doc_ids[idx],
-                "title": titles[idx],
-                "department_id": depts[idx],
-                "content": contents[idx],
-                "metadata": json.loads(metas[idx] or "{}"),
-                "cosine_sim": round(sim, 4),
-                "vector_rank": rank + 1
+                "chunk_id": cid,
+                "document_id": r["document_id"],
+                "title": r["title"],
+                "department_id": r["department_id"],
+                "content": r["content"],
+                "metadata": json.loads(r["metadata_json"] or "{}"),
+                "cosine_sim": round(sim_by_id[cid], 4),
+                "vector_rank": rank
             })
         return results
 
@@ -196,15 +201,12 @@ class HybridRetriever:
         start_time = time.perf_counter()
         conn = get_db_connection(self.db_path)
 
-        # 1. Retrieve candidates from both sources
-        lexical_candidates = self.search_lexical(conn, query, department_filter, limit=30)
-        vector_candidates = self.search_vector(conn, query, department_filter, limit=30)
+        lexical_candidates = self.search_lexical(conn, query, department_filter, limit=25)
+        vector_candidates = self.search_vector(conn, query, department_filter, limit=25)
 
-        # 2. Map and fuse with Reciprocal Rank Fusion
         fused_scores: Dict[int, Dict[str, Any]] = {}
         K = RRF_K_CONSTANT
 
-        # Index lexical results
         for item in lexical_candidates:
             cid = item["chunk_id"]
             rank = item["lexical_rank"]
@@ -225,7 +227,6 @@ class HybridRetriever:
                 "modalities": ["lexical"]
             }
 
-        # Combine with vector results
         for item in vector_candidates:
             cid = item["chunk_id"]
             rank = item["vector_rank"]
@@ -255,7 +256,6 @@ class HybridRetriever:
 
         conn.close()
 
-        # 3. Sort by combined RRF score descending
         sorted_chunks = sorted(fused_scores.values(), key=lambda x: x["rrf_score"], reverse=True)
         top_results = sorted_chunks[:top_k]
 

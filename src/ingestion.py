@@ -1,9 +1,9 @@
 """
-Ingestion pipeline module for Club Atlético Puerto Marina.
-Parses markdown frontmatter, chunks documents intelligently with contextual prefixes,
-generates dense vector embeddings, and populates SQLite relational + FTS5 tables.
+Ingestion pipeline module for Club Atlético Puerto Marina (v2.0).
+- Parses markdown frontmatter and chunks documents with contextual prefixes.
+- Preserves Markdown table headers across chunks.
+- Automatically indexes relational SQL tables (players, staff, departments) into RAG chunks.
 """
-import os
 import re
 import json
 from pathlib import Path
@@ -14,7 +14,6 @@ from src.config import RAW_DOCS_DIR, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, DB_P
 from src.database import get_db_connection, init_database
 from src.embeddings import get_embedding_engine
 
-# Seed master data
 INITIAL_DEPARTMENTS = [
     {
         "id": "servicio_medico",
@@ -61,18 +60,18 @@ INITIAL_DEPARTMENTS = [
 ]
 
 INITIAL_PLAYERS = [
-    {"dorsal": 1, "name": "Mateo Rossi", "nickname": "Araña", "position": "Arquero Titular", "age": 29, "height_m": 1.89, "weight_kg": 84.2, "notes": "Especialista en mano a mano, excelente juego aéreo."},
-    {"dorsal": 2, "name": "Bruno Benítez", "nickname": "Mariscal", "position": "Defensor Central Derecho", "age": 31, "height_m": 1.86, "weight_kg": 82.1, "notes": "Capitán del equipo, líder del vestuario, gran juego aéreo defensivo."},
+    {"dorsal": 1, "name": "Mateo Rossi", "nickname": "Araña", "position": "Arquero Titular", "age": 29, "height_m": 1.89, "weight_kg": 84.2, "notes": "Especialista en mano a mano, excelente juego aéreo. Subcapitán."},
+    {"dorsal": 2, "name": "Bruno Benítez", "nickname": "Mariscal", "position": "Defensor Central Derecho", "age": 31, "height_m": 1.86, "weight_kg": 82.1, "notes": "Capitán del equipo, líder del vestuario y tesorero del fondo común, gran juego aéreo defensivo."},
     {"dorsal": 3, "name": "Facundo Medina", "nickname": "Zurdo", "position": "Lateral Izquierdo", "age": 24, "height_m": 1.77, "weight_kg": 73.0, "notes": "Recorrido de banda, precisión en centros, ejecutor de córners zurdos."},
     {"dorsal": 4, "name": "Rodrigo Aguirre", "nickname": "Vasco", "position": "Lateral Derecho", "age": 27, "height_m": 1.80, "weight_kg": 76.2, "notes": "Marcaje agresivo, potente físicamente, subida constante."},
-    {"dorsal": 5, "name": "Thiago Almada", "nickname": "Pulpo", "position": "Mediocampista Central / Tapón", "age": 25, "height_m": 1.78, "weight_kg": 75.4, "notes": "Equilibrio defensivo, recuperador de pelotas, primer pase vertical."},
-    {"dorsal": 6, "name": "Lautaro Carrizo", "nickname": "Toro", "position": "Defensor Central Izquierdo", "age": 23, "height_m": 1.88, "weight_kg": 83.0, "notes": "Lesionado: Esguince de tobillo grado II. En RTP Fase 3."},
-    {"dorsal": 7, "name": "Franco Valenzuela", "nickname": "Rayo", "position": "Extremo Derecho", "age": 22, "height_m": 1.74, "weight_kg": 69.1, "notes": "Velocidad pura (34 km/h), desborde. Carga controlada por sobrecarga en bíceps femoral."},
-    {"dorsal": 8, "name": "Gastón Pereyra", "nickname": "El Duende", "position": "Volante Mixto / Box-to-Box", "age": 26, "height_m": 1.82, "weight_kg": 77.8, "notes": "Despliegue aeróbico (8 km/partido), llegada al área rival y remate."},
+    {"dorsal": 5, "name": "Thiago Almada", "nickname": "Pulpo", "position": "Mediocampista Central / Tapón", "age": 25, "height_m": 1.78, "weight_kg": 75.4, "notes": "Equilibrio defensivo, recuperador de pelotas, primer pase vertical. Subcapitán."},
+    {"dorsal": 6, "name": "Lautaro Carrizo", "nickname": "Toro", "position": "Defensor Central Izquierdo", "age": 23, "height_m": 1.88, "weight_kg": 83.0, "notes": "Lesionado: Esguince de tobillo izquierdo grado II (LTFA). En RTP Fase 3."},
+    {"dorsal": 7, "name": "Franco Valenzuela", "nickname": "Rayo", "position": "Extremo Derecho", "age": 22, "height_m": 1.74, "weight_kg": 69.1, "notes": "Velocidad pura (34 km/h), desborde. Carga controlada por sobrecarga en bíceps femoral derecho (ACWR 1.48)."},
+    {"dorsal": 8, "name": "Gastón Pereyra", "nickname": "El Duende", "position": "Volante Mixto / Box-to-Box", "age": 26, "height_m": 1.82, "weight_kg": 77.8, "notes": "Despliegue aeróbico (7.840 m en MD-4), llegada al área rival y remate."},
     {"dorsal": 9, "name": "Tomás Cáceres", "nickname": "Flecha", "position": "Segundo Delantero / Extremo", "age": 20, "height_m": 1.79, "weight_kg": 72.4, "notes": "Canterano revelación, alta tasa de presión en campo contrario (5.4/90min)."},
-    {"dorsal": 10, "name": "Julián Morales", "nickname": "La Joya", "position": "Mediapunta / Enganche", "age": 26, "height_m": 1.72, "weight_kg": 68.3, "notes": "Creador de juego, ejecutor N°1 de penales y tiros libres. Alta médica de pubalgia."},
+    {"dorsal": 10, "name": "Julián Morales", "nickname": "La Joya", "position": "Mediapunta / Enganche", "age": 26, "height_m": 1.72, "weight_kg": 68.3, "notes": "Creador de juego, ejecutor N°1 de penales y tiros libres. Alta médica definitiva de pubalgia."},
     {"dorsal": 11, "name": "Emiliano Santos", "nickname": "Tanque", "position": "Centrodelantero Goleador", "age": 28, "height_m": 1.87, "weight_kg": 86.4, "notes": "Goleador del torneo (11 goles), juego de espaldas y fijación de centrales."},
-    {"dorsal": 12, "name": "Lucas Barreto", "nickname": "Flaco", "position": "Arquero Suplente", "age": 22, "height_m": 1.91, "weight_kg": 85.0, "notes": "Gran envergadura, arquero de proyección."},
+    {"dorsal": 12, "name": "Lucas Barreto", "nickname": "Flaco", "position": "Arquero Suplente", "age": 22, "height_m": 1.91, "weight_kg": 85.0, "notes": "Gran envergadura (1.91 m, 85 kg), arquero de proyección."},
     {"dorsal": 14, "name": "Agustín Ríos", "nickname": "Motor", "position": "Volante Defensivo / Central Ocasional", "age": 23, "height_m": 1.81, "weight_kg": 77.2, "notes": "Diagnóstico de celiaquía: requiere protocolo nutricional estricto Sin TACC."},
     {"dorsal": 18, "name": "Marco Tagliafico", "nickname": "Pibe", "position": "Extremo / Lateral Izquierdo Juvenil", "age": 19, "height_m": 1.76, "weight_kg": 71.0, "notes": "Promovido de reserva, dinamismo y desfachatez en el 1v1."}
 ]
@@ -94,8 +93,7 @@ INITIAL_STAFF = [
 def seed_metadata(conn) -> None:
     """Populates departments, players, and staff tables."""
     cur = conn.cursor()
-    
-    # Departments
+
     for dept in INITIAL_DEPARTMENTS:
         cur.execute("""
             INSERT INTO departments (id, name, description, manager)
@@ -106,7 +104,6 @@ def seed_metadata(conn) -> None:
                 manager=excluded.manager;
         """, (dept["id"], dept["name"], dept["description"], dept["manager"]))
 
-    # Players
     for p in INITIAL_PLAYERS:
         cur.execute("""
             INSERT INTO players (dorsal, name, nickname, position, age, height_m, weight_kg, notes)
@@ -121,7 +118,6 @@ def seed_metadata(conn) -> None:
                 notes=excluded.notes;
         """, (p["dorsal"], p["name"], p["nickname"], p["position"], p["age"], p["height_m"], p["weight_kg"], p["notes"]))
 
-    # Staff
     for s in INITIAL_STAFF:
         cur.execute("SELECT id FROM staff WHERE name = ?", (s["name"],))
         existing = cur.fetchone()
@@ -154,7 +150,6 @@ def parse_markdown_file(file_path: Path) -> Dict[str, Any]:
             except Exception as e:
                 print(f"Warning: could not parse frontmatter in {file_path}: {e}")
 
-    # Fallback values
     doc_code = frontmatter.get("id") or file_path.stem
     title = frontmatter.get("title") or file_path.stem.replace("-", " ").title()
     department_id = frontmatter.get("department") or file_path.parent.name
@@ -179,9 +174,8 @@ def parse_markdown_file(file_path: Path) -> Dict[str, Any]:
 
 def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Intelligently chunks markdown content by headers (##, ###) or sliding window,
-    enriching each chunk with an explicit contextual prefix (Title, Department, Date, Author)
-    so the embedding captures full semantic context.
+    Chunks markdown content by headers (##, ###) or sliding window,
+    enriching each chunk with an explicit contextual prefix.
     """
     content = doc_meta["raw_content"]
     title = doc_meta["title"]
@@ -190,7 +184,6 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     date_str = doc_meta["date"]
     tags = doc_meta["tags"]
 
-    # Split on markdown section headers (## or ###)
     section_pattern = re.compile(r'(?=^#{2,3}\s+)', re.MULTILINE)
     raw_sections = [s.strip() for s in section_pattern.split(content) if s.strip()]
 
@@ -201,14 +194,11 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     chunk_idx = 0
 
     for sec in raw_sections:
-        # If section is within comfortable chunk length
         if len(sec) <= CHUNK_SIZE_CHARS:
-            chunk_text = sec
-            # Contextual prefix for high semantic accuracy in vector and lexical search
             augmented_content = (
                 f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
                 f"TAGS: {tags}\n\n"
-                f"{chunk_text}"
+                f"{sec}"
             )
             final_chunks.append({
                 "chunk_index": chunk_idx,
@@ -219,13 +209,11 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "doc_code": doc_meta["doc_code"],
                     "date": date_str,
                     "author": author,
-                    "tags": tags,
-                    "raw_section": chunk_text[:200]
+                    "tags": tags
                 }
             })
             chunk_idx += 1
         else:
-            # Sub-split long section with sliding window
             paragraphs = sec.split("\n\n")
             current_buffer = []
             current_len = 0
@@ -252,7 +240,6 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
                         }
                     })
                     chunk_idx += 1
-                    # Sliding overlap: keep last paragraph if reasonable
                     if len(current_buffer[-1]) < CHUNK_OVERLAP_CHARS:
                         current_buffer = [current_buffer[-1], p]
                         current_len = len(current_buffer[0]) + p_len
@@ -287,17 +274,14 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     return final_chunks
 
 
-def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
-    """Ingests a single markdown document and inserts chunks into SQLite & FTS5."""
-    doc_meta = parse_markdown_file(file_path)
+def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[int, int]:
+    """Inserts or updates a parsed document dict and indexes its chunks into SQLite & FTS5."""
     cur = conn.cursor()
 
-    # Check if department exists, if not fallback to 'cuerpo_tecnico'
     cur.execute("SELECT id FROM departments WHERE id = ?", (doc_meta["department_id"],))
     if not cur.fetchone():
         doc_meta["department_id"] = "cuerpo_tecnico"
 
-    # Insert or update document
     cur.execute("""
         INSERT INTO documents (doc_code, title, department_id, author, date, file_path, confidentiality, tags, raw_content)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -329,27 +313,24 @@ def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
         cur.execute("SELECT id FROM documents WHERE doc_code = ?", (doc_meta["doc_code"],))
         doc_id = cur.fetchone()["id"]
 
-    # Delete previous chunks and FTS5 entries for this document
+    # Delete previous chunks and FTS5 entries
     cur.execute("SELECT id FROM chunks WHERE document_id = ?", (doc_id,))
     old_chunk_ids = [r["id"] for r in cur.fetchall()]
     for cid in old_chunk_ids:
-        cur.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (str(cid),))
+        cur.execute("DELETE FROM chunks_fts WHERE rowid = ?", (cid,))
     cur.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
 
-    # Chunk content
     chunks = chunk_document(doc_meta)
     if not chunks:
         return doc_id, 0
 
-    # Batch embed chunks
     chunk_texts = [c["content"] for c in chunks]
     vectors = embedder.embed_batch(chunk_texts)
 
-    # Insert into chunks and chunks_fts
     for c, vec in zip(chunks, vectors):
         blob = embedder.vector_to_blob(vec)
         meta_json = json.dumps(c["metadata"], ensure_ascii=False)
-        
+
         cur.execute("""
             INSERT INTO chunks (document_id, chunk_index, title, department_id, content, embedding, metadata_json)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -357,39 +338,126 @@ def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
         """, (doc_id, c["chunk_index"], c["title"], c["department_id"], c["content"], blob, meta_json))
         chunk_id = cur.fetchone()[0]
 
-        # Sync to FTS5 virtual table
+        # Insert into FTS5 with explicit rowid = chunk_id for zero-cast JOINs
         cur.execute("""
-            INSERT INTO chunks_fts (chunk_id, title, department_id, content, tags)
-            VALUES (?, ?, ?, ?, ?);
-        """, (str(chunk_id), c["title"], c["department_id"], c["content"], doc_meta["tags"]))
+            INSERT INTO chunks_fts (rowid, chunk_id, title, department_id, content, tags)
+            VALUES (?, ?, ?, ?, ?, ?);
+        """, (chunk_id, str(chunk_id), c["title"], c["department_id"], c["content"], doc_meta["tags"]))
 
     conn.commit()
     return doc_id, len(chunks)
 
 
+def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
+    """Ingests a markdown file from disk."""
+    doc_meta = parse_markdown_file(file_path)
+    return ingest_doc_metadata_dict(doc_meta, conn, embedder)
+
+
+def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
+    """
+    NEW IN V2.0: Synchronizes relational SQL tables (players, staff, departments)
+    into virtual RAG documents so any natural language query about player biometrics,
+    dorsals, roles, emails, or phone numbers is retrieved by both BM25 and Vector search.
+    """
+    cur = conn.cursor()
+
+    # 1. Build Virtual Roster Document from SQL `players`
+    players = cur.execute("SELECT * FROM players ORDER BY dorsal ASC;").fetchall()
+    roster_lines = [
+        "## Plantel Profesional Completo - Fichas Antropométricas, Dorsales y Estado",
+        "| Dorsal | Nombre | Apodo | Posición | Edad | Altura (m) | Peso (kg) | Observaciones Clínicas y Tácticas |",
+        "|---|---|---|---|---|---|---|---|"
+    ]
+    player_bullets = ["\n## Detalle Individual de Futbolistas del Plantel"]
+    for p in players:
+        roster_lines.append(
+            f"| #{p['dorsal']} | {p['name']} | {p['nickname']} | {p['position']} | {p['age']} años | {p['height_m']} m | {p['weight_kg']} kg | {p['notes']} |"
+        )
+        player_bullets.append(
+            f"- **Dorsal #{p['dorsal']} - {p['name']} (\"{p['nickname']}\")**: Juega como {p['position']}, tiene {p['age']} años, mide {p['height_m']} m y pesa {p['weight_kg']} kg. Nota oficial: {p['notes']}"
+        )
+
+    roster_doc = {
+        "doc_code": "SQL-PLANTEL-2026",
+        "title": "Padrón Oficial del Plantel Profesional - Peso, Altura, Edad y Dorsales",
+        "department_id": "cuerpo_tecnico",
+        "author": "Secretaría Técnica y Base de Datos SQL",
+        "date": "2026-11-06",
+        "confidentiality": "interno",
+        "tags": "plantel, jugadores, dorsales, altura, peso, edad, posicion, arquero, delantero, defensor, mediocampista",
+        "raw_content": "\n".join(roster_lines) + "\n\n" + "\n".join(player_bullets),
+        "file_path": "sqlite://players"
+    }
+
+    # 2. Build Virtual Staff & Departments Document from SQL `staff` & `departments`
+    staff_rows = cur.execute("""
+        SELECT s.*, d.name as dept_name, d.description as dept_desc
+        FROM staff s
+        JOIN departments d ON d.id = s.department_id
+        ORDER BY s.id ASC;
+    """).fetchall()
+
+    staff_lines = [
+        "## Directorio Oficial de Staff Técnico, Médico, Nutrición y Operaciones (Contactos, Teléfonos y Correos)",
+        "| Profesional | Cargo / Rol | Departamento | Correo Electrónico (Email) | Teléfono Directo |",
+        "|---|---|---|---|---|"
+    ]
+    staff_bullets = ["\n## Contacto Directo y Responsabilidades del Staff"]
+    for s in staff_rows:
+        staff_lines.append(
+            f"| {s['name']} | {s['role']} | {s['dept_name']} | {s['email']} | {s['phone']} |"
+        )
+        staff_bullets.append(
+            f"- **{s['name']}** ({s['role']} en {s['dept_name']}): Email `{s['email']}` | Teléfono `{s['phone']}`. Área encargada de: {s['dept_desc']}"
+        )
+
+    staff_doc = {
+        "doc_code": "SQL-STAFF-2026",
+        "title": "Directorio Oficial del Staff Profesional, Correos, Teléfonos y Jefaturas de Área",
+        "department_id": "disciplina_prensa",
+        "author": "Gerencia de Operaciones y Recursos Humanos",
+        "date": "2026-11-06",
+        "confidentiality": "interno",
+        "tags": "staff, directorio, telefono, email, correo, contacto, medico, nutricionista, kinesiologa, entrenador, preparador_fisico",
+        "raw_content": "\n".join(staff_lines) + "\n\n" + "\n".join(staff_bullets),
+        "file_path": "sqlite://staff"
+    }
+
+    _, c1 = ingest_doc_metadata_dict(roster_doc, conn, embedder)
+    _, c2 = ingest_doc_metadata_dict(staff_doc, conn, embedder)
+    return 2, (c1 + c2)
+
+
 def run_full_ingestion() -> Dict[str, Any]:
-    """Runs end-to-end ingestion over all raw documents in the data folder."""
-    print("Iniciando inicialización de la base de datos...")
+    """Runs end-to-end ingestion over all markdown files AND relational SQL tables."""
+    print("1. Inicializando esquema SQLite + FTS5...")
     init_database(DB_PATH)
     conn = get_db_connection(DB_PATH)
     seed_metadata(conn)
 
-    print("Cargando modelo de embeddings (FastEmbed multilingual)...")
+    print("2. Cargando motor de embeddings multilingüe (FastEmbed ONNX)...")
     embedder = get_embedding_engine()
 
     total_docs = 0
     total_chunks = 0
-    all_files = list(RAW_DOCS_DIR.rglob("*.md"))
+    all_files = sorted(list(RAW_DOCS_DIR.rglob("*.md")))
 
-    print(f"Encontrados {len(all_files)} documentos para indexar en {RAW_DOCS_DIR}...")
+    print(f"3. Indexando {len(all_files)} documentos Markdown desde {RAW_DOCS_DIR}...")
     for f in all_files:
         doc_id, count = ingest_document_file(f, conn, embedder)
         total_docs += 1
         total_chunks += count
-        print(f" -> Indexado: {f.name} (Doc ID {doc_id}, {count} chunks generados)")
+        print(f"   -> [MD] {f.name} (Doc ID {doc_id}: {count} chunks)")
+
+    print("4. Sincronizando tablas relacionales SQL (players, staff, departments) al índice RAG...")
+    sql_docs, sql_chunks = sync_relational_entities_to_rag(conn, embedder)
+    total_docs += sql_docs
+    total_chunks += sql_chunks
+    print(f"   -> [SQL] {sql_docs} documentos virtuales generados ({sql_chunks} chunks)")
 
     conn.close()
-    print(f"Ingesta finalizada: {total_docs} documentos, {total_chunks} fragmentos indexados.")
+    print(f"Ingesta completada con éxito: {total_docs} documentos y {total_chunks} fragmentos activos.")
     return {
         "documents_count": total_docs,
         "chunks_count": total_chunks,

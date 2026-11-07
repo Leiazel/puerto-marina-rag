@@ -1,0 +1,132 @@
+"""
+Database module for SQLite with FTS5 and Vector BLOB storage.
+Optimized for ultra-fast hybrid queries (Lexical BM25 + Dense Vectors).
+"""
+import sqlite3
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from src.config import DB_PATH, DATABASE_DIR
+
+
+def get_db_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    """Returns a SQLite connection with row factory enabled."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL;")  # High-concurrency Write-Ahead Logging
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA cache_size = -64000;")  # 64MB cache
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+def init_database(db_path: Path = DB_PATH) -> None:
+    """Creates tables, indexes, and FTS5 virtual tables."""
+    conn = get_db_connection(db_path)
+    cur = conn.cursor()
+
+    # 1. Departments table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS departments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        manager TEXT
+    );
+    """)
+
+    # 2. Players table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS players (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dorsal INTEGER NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        nickname TEXT,
+        position TEXT NOT NULL,
+        age INTEGER,
+        height_m REAL,
+        weight_kg REAL,
+        notes TEXT
+    );
+    """)
+
+    # 3. Staff members table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS staff (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        department_id TEXT NOT NULL REFERENCES departments(id),
+        email TEXT,
+        phone TEXT
+    );
+    """)
+
+    # 4. Documents table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_code TEXT UNIQUE,
+        title TEXT NOT NULL,
+        department_id TEXT NOT NULL REFERENCES departments(id),
+        author TEXT,
+        date TEXT,
+        file_path TEXT,
+        confidentiality TEXT DEFAULT 'interno',
+        tags TEXT,
+        raw_content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # 5. Chunks table (Stores text + float32 vector embedding as BLOB)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        chunk_index INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        department_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        embedding BLOB NOT NULL,
+        metadata_json TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # 6. FTS5 Virtual Table for full-text search with BM25 ranking
+    # Using unicode61 tokenizer with remove_diacritics 2 for perfect Spanish matching
+    cur.execute("""
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+        chunk_id UNINDEXED,
+        title,
+        department_id,
+        content,
+        tags,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+    """)
+
+    # 7. Query logs for monitoring and audit
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS query_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query_text TEXT NOT NULL,
+        department_filter TEXT,
+        retrieved_chunks_count INTEGER,
+        top_similarity REAL,
+        response_text TEXT,
+        retrieval_ms REAL,
+        total_ms REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # Indexes for performance
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(document_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_dept ON chunks(department_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_dept ON documents(department_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_date ON documents(date);")
+
+    conn.commit()
+    conn.close()

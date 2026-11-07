@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Club Atlético Puerto Marina - Sistema RAG Operativo</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="header-container">
+      <div class="brand">
+        <div class="club-crest">⚓</div>
+        <div class="brand-text">
+          <h1>Club Atlético Puerto Marina</h1>
+          <p>Sistema RAG de Inteligencia Operativa y Rendimiento Deportivo</p>
+        </div>
+      </div>
+
+      <nav class="nav-tabs">
+        <button class="nav-btn active" data-tab="tab-query">🔎 Consola RAG</button>
+        <button class="nav-btn" data-tab="tab-players">⚽ Plantel</button>
+        <button class="nav-btn" data-tab="tab-docs">📄 Documentos</button>
+        <button class="nav-btn" data-tab="tab-staff">👔 Staff</button>
+        <button class="nav-btn" data-tab="tab-ingest">📥 Ingesta en Vivo</button>
+        <button class="nav-btn" data-tab="tab-logs">📊 Telemetría</button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main>
+
+    <!-- Stats Ribbon -->
+    <div class="stats-ribbon">
+      <div class="stat-card">
+        <span class="stat-label">Documentos Oficiales</span>
+        <span class="stat-val" id="stat-docs">-</span>
+        <span class="stat-sub">7 departamentos operativos</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Fragmentos (Chunks)</span>
+        <span class="stat-val" id="stat-chunks">-</span>
+        <span class="stat-sub">SQLite FTS5 + Vectores 384d</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Plantel Profesional</span>
+        <span class="stat-val" id="stat-players">-</span>
+        <span class="stat-sub">14 perfiles biomédicos</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Latencia RAG Promedio</span>
+        <span class="stat-val" id="stat-latency">-</span>
+        <span class="stat-sub">Búsqueda Híbrida RRF</span>
+      </div>
+    </div>
+
+    <!-- TAB 1: RAG Query Console -->
+    <section id="tab-query" class="tab-pane active">
+      <div class="query-box-container">
+        <div class="query-input-group">
+          <input 
+            type="text" 
+            id="query-input" 
+            class="query-input" 
+            placeholder="Pregunta sobre partes médicos, GPS Catapult, táctica, nutrición o logística..." 
+            autocomplete="off"
+          />
+          <button id="submit-btn" class="query-submit-btn" onclick="executeQuery()">
+            <span>⚡</span> Consultar RAG
+          </button>
+        </div>
+
+        <!-- Controls: Department Filter, Top-K, Hybrid Alpha -->
+        <div class="controls-bar">
+          <div class="control-item">
+            <label for="dept-filter">Departamento:</label>
+            <select id="dept-filter" class="control-select">
+              <option value="">Todos los departamentos</option>
+              <option value="servicio_medico">Servicio Médico y Fisioterapia</option>
+              <option value="preparacion_fisica">Preparación Física y GPS</option>
+              <option value="cuerpo_tecnico">Cuerpo Técnico y Táctica</option>
+              <option value="nutricion">Nutrición y Rendimiento</option>
+              <option value="scouting">Scouting e Inteligencia</option>
+              <option value="logistica_viajes">Operaciones y Logística</option>
+              <option value="disciplina_prensa">Prensa y Reglamento</option>
+            </select>
+          </div>
+
+          <div class="control-item">
+            <label for="top-k-select">Fragmentos Top-K:</label>
+            <select id="top-k-select" class="control-select">
+              <option value="3">Top 3</option>
+              <option value="4" selected>Top 4 (Recomendado)</option>
+              <option value="6">Top 6</option>
+              <option value="8">Top 8</option>
+            </select>
+          </div>
+
+          <div class="control-item slider-container">
+            <label for="alpha-slider">Equilibrio Híbrido:</label>
+            <input type="range" id="alpha-slider" min="0" max="1" step="0.1" value="0.5">
+            <span id="alpha-val" style="font-size: 0.8rem; color: #f59e0b; min-width: 130px;">50% BM25 / 50% Vector</span>
+          </div>
+        </div>
+
+        <!-- Suggestion Chips -->
+        <div class="suggestions-chips">
+          <span class="suggestion-chip" onclick="executeQuery('¿Cuál es la situación médica de Lautaro Carrizo y cuándo puede volver a jugar?')">
+            🩹 Lesión de Lautaro Carrizo
+          </span>
+          <span class="suggestion-chip" onclick="executeQuery('¿Qué jugador tiene alerta de sobrecarga física según el reporte GPS Catapult?')">
+            ⚡ Alerta GPS y Fatiga
+          </span>
+          <span class="suggestion-chip" onclick="executeQuery('¿Quién es celíaco en el plantel y qué menú especial Sin TACC requiere?')">
+            🥗 Dieta Celíaca (Agustín Ríos)
+          </span>
+          <span class="suggestion-chip" onclick="executeQuery('¿Cuál es el análisis táctico y las debilidades del rival Deportivo Los Andes?')">
+            📋 Scouting de Los Andes
+          </span>
+          <span class="suggestion-chip" onclick="executeQuery('¿Cuáles son las multas por llegar tarde o sobrepeso según el reglamento interno?')">
+            ⚖️ Multas y Convivencia
+          </span>
+          <span class="suggestion-chip" onclick="executeQuery('¿En qué hotel y en qué habitaciones se alojará el equipo para la semifinal?')">
+            🏨 Hotel e Itinerario de Viaje
+          </span>
+          <span class="suggestion-chip" onclick="executeQuery('¿Qué evaluación tiene el volante sub-21 Rodrigo Chelo Vargas para fichajes?')">
+            🔭 Scouting Rodrigo Vargas
+          </span>
+        </div>
+      </div>
+
+      <!-- Result Card -->
+      <div id="result-card" class="result-card">
+        <div class="result-header">
+          <h2 style="font-size: 1.2rem; color: #fff;">Respuesta Generada con Fundamentación (RAG)</h2>
+          <div id="telemetry-badges" class="telemetry-badges"></div>
+        </div>
+
+        <div id="answer-content" class="answer-body"></div>
+
+        <!-- Chunks Accordion -->
+        <div class="chunks-section">
+          <div class="chunks-title">
+            <span>Evidencia Documental Recuperada (Ranking RRF)</span>
+            <span style="font-size: 0.8rem; font-weight: normal; color: #94a3b8;">Clic en cada tarjeta para desplegar el texto</span>
+          </div>
+          <div id="chunks-container"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: Players Roster -->
+    <section id="tab-players" class="tab-pane">
+      <div style="margin-bottom: 1.5rem;">
+        <h2 style="font-size: 1.3rem; color: #fff;">Plantel Profesional de Primera División</h2>
+        <p style="color: var(--text-muted); font-size: 0.85rem;">Fichas médicas, físicas y tácticas sincronizadas con la base RAG.</p>
+      </div>
+      <div id="players-grid" class="grid-cards"></div>
+    </section>
+
+    <!-- TAB 3: Documents Archive -->
+    <section id="tab-docs" class="tab-pane">
+      <div style="margin-bottom: 1.5rem;">
+        <h2 style="font-size: 1.3rem; color: #fff;">Archivo Documental del Club</h2>
+        <p style="color: var(--text-muted); font-size: 0.85rem;">Documentos indexados en SQLite con partición de fragmentos y vectores FastEmbed.</p>
+      </div>
+      <div class="data-table-container">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Código</th>
+              <th>Título</th>
+              <th>Departamento</th>
+              <th>Autor</th>
+              <th>Fecha</th>
+              <th>Chunks</th>
+            </tr>
+          </thead>
+          <tbody id="docs-table-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- TAB 4: Staff Directory -->
+    <section id="tab-staff" class="tab-pane">
+      <div style="margin-bottom: 1.5rem;">
+        <h2 style="font-size: 1.3rem; color: #fff;">Cuerpo Técnico y Especialistas</h2>
+        <p style="color: var(--text-muted); font-size: 0.85rem;">Directores de área, médicos traumatólogos, kinesiólogos, preparadores físicos y nutricionistas.</p>
+      </div>
+      <div id="staff-grid" class="grid-cards"></div>
+    </section>
+
+    <!-- TAB 5: Live Document Ingestion -->
+    <section id="tab-ingest" class="tab-pane">
+      <div class="form-card">
+        <h2 style="font-size: 1.25rem; color: #fff; margin-bottom: 0.5rem;">Ingesta de Nuevo Documento</h2>
+        <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem;">
+          Carga un nuevo informe oficial. El pipeline lo procesará, generará fragmentos contextualizados, calculará embeddings vectoriales y lo sincronizará con la tabla virtual FTS5.
+        </p>
+
+        <form id="ingest-form">
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            <div class="form-group">
+              <label class="form-label" for="ingest-code">Código Único (Ej: MED-2026-11-08-01):</label>
+              <input type="text" id="ingest-code" class="form-input" required placeholder="MED-2026-11-08-01">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="ingest-dept">Departamento Responsable:</label>
+              <select id="ingest-dept" class="form-select" required>
+                <option value="servicio_medico">Servicio Médico y Fisioterapia</option>
+                <option value="preparacion_fisica">Preparación Física y GPS</option>
+                <option value="cuerpo_tecnico">Cuerpo Técnico y Táctica</option>
+                <option value="nutricion">Nutrición y Rendimiento</option>
+                <option value="scouting">Scouting e Inteligencia</option>
+                <option value="logistica_viajes">Operaciones y Logística</option>
+                <option value="disciplina_prensa">Prensa y Reglamento</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="ingest-title">Título del Documento:</label>
+            <input type="text" id="ingest-title" class="form-input" required placeholder="Parte Médico Post-Partido Semifinal">
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            <div class="form-group">
+              <label class="form-label" for="ingest-author">Autor / Especialista:</label>
+              <input type="text" id="ingest-author" class="form-input" required placeholder="Dr. Federico Arismendi">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="ingest-date">Fecha de Emisión:</label>
+              <input type="date" id="ingest-date" class="form-input" value="2026-11-08" required>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="ingest-tags">Etiquetas (separadas por comas):</label>
+            <input type="text" id="ingest-tags" class="form-input" placeholder="medico, lesiones, post_partido, tobillo">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="ingest-content">Cuerpo del Documento (Markdown):</label>
+            <textarea id="ingest-content" class="form-textarea" required placeholder="### 1. Evolución Clínica&#10;- El jugador completó 30 minutos sin molestias..."></textarea>
+          </div>
+
+          <button type="submit" id="ingest-submit-btn" class="query-submit-btn" style="width: 100%; justify-content: center; padding: 0.85rem;">
+            📥 Indexar Documento en Base RAG
+          </button>
+        </form>
+      </div>
+    </section>
+
+    <!-- TAB 6: Query Telemetry & Audit Logs -->
+    <section id="tab-logs" class="tab-pane">
+      <div style="margin-bottom: 1.5rem;">
+        <h2 style="font-size: 1.3rem; color: #fff;">Auditoría y Registro de Consultas (Logs)</h2>
+        <p style="color: var(--text-muted); font-size: 0.85rem;">Trazabilidad completa de consultas, filtros aplicados, latencias y similitudes registradas en SQLite.</p>
+      </div>
+      <div class="data-table-container">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Consulta</th>
+              <th>Filtro Área</th>
+              <th>Chunks</th>
+              <th>Latencia</th>
+              <th>Similitud Top</th>
+            </tr>
+          </thead>
+          <tbody id="logs-table-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer>
+    Club Atlético Puerto Marina • Sistema RAG de Alto Rendimiento • Motor SQLite Híbrido (FTS5 BM25 + FastEmbed Multilingual ONNX + RRF Fusion)
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

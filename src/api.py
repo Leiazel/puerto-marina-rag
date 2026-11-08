@@ -59,6 +59,12 @@ def get_status():
     }
 
 
+@app.get("/api/llm/health")
+def get_llm_health():
+    """Checks connectivity and available models on the configured LLM provider."""
+    return pipeline.generator.check_llm_health()
+
+
 @app.post("/api/query")
 def run_query(req: QueryRequest):
     if not req.query.strip():

@@ -87,7 +87,22 @@ class TestClubRAGSystemV2(unittest.TestCase):
         staff_out = self.pipeline.ask("¿Cuál es el correo electrónico y teléfono de la nutricionista Sofía Carrizo?")
         self.assertIn("scarrizo@puertomarina.fc", staff_out["answer"])
         player_out = self.pipeline.ask("¿Cuánto mide y cuánto pesa el arquero suplente Lucas Barreto?")
-        self.assertIn("1.91", player_out["answer"])
+        self.assertTrue("1.91" in player_out["answer"] or "1,91" in player_out["answer"])
+
+    def test_11_llm_config_aliases_and_404_auto_recovery(self):
+        """Verifies that OPENAI_MODEL alias resolves properly and 404 model_not_found auto-recovers."""
+        self.assertNotEqual(self.generator.model, "gpt-4o-mini")
+        if self.generator.use_llm and self.generator.api_key:
+            health = self.generator.check_llm_health()
+            self.assertEqual(health["status"], "connected")
+            # Simulate an invalid model name (which previously caused HTTP 404) and verify auto-recovery
+            original_model = self.generator.model
+            self.generator.model = "gpt-4o-mini-nonexistent"
+            chunks = self.retriever.hybrid_search("Lesión de Lautaro Carrizo", top_k=2)["results"]
+            res = self.generator.generate_grounded_answer("¿Qué lesión tiene Lautaro Carrizo?", chunks)
+            self.assertTrue(res["model_used"].startswith("llm:"))
+            self.assertNotEqual(self.generator.model, "gpt-4o-mini-nonexistent")
+            self.generator.model = original_model
 
 
 if __name__ == "__main__":

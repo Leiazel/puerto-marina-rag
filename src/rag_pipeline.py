@@ -116,7 +116,8 @@ class ClubRAGPipeline:
 
         conn.close()
 
-        llm_active = USE_EXTERNAL_LLM or bool(LLM_API_KEY)
+        self.generator._refresh_config_if_needed()
+        llm_active = self.generator.use_llm and bool(self.generator.api_key)
         return {
             "documents_count": docs_count,
             "chunks_count": chunks_count,
@@ -125,6 +126,7 @@ class ClubRAGPipeline:
             "departments_count": dept_count,
             "total_queries_logged": queries_count,
             "average_query_latency_ms": avg_latency,
-            "synthesis_mode": f"LLM ({LLM_MODEL})" if llm_active else "Local Grounded Synthesizer v2",
+            "synthesis_mode": f"LLM ({self.generator.model})" if llm_active else "Local Grounded Synthesizer v2",
+            "llm_api_base": self.generator.api_base if llm_active else None,
             "departments": [dict(r) for r in dept_docs]
         }

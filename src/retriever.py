@@ -39,12 +39,15 @@ class HybridRetriever:
         """
         no_accents = _strip_accents(query.lower())
         cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in no_accents)
-        raw_words = [w for w in cleaned.split() if len(w) >= 2]
+        raw_words = [w for w in cleaned.split() if len(w) >= 2 or w.isdigit()]
         if not raw_words:
             return ""
 
-        # Filter out Spanish stopwords so BM25 focuses strictly on domain terms
-        meaningful_words = [w for w in raw_words if len(w) > 2 and w not in SPANISH_STOPWORDS]
+        # Filter out Spanish stopwords so BM25 focuses strictly on domain terms and numbers
+        meaningful_words = [
+            w for w in raw_words
+            if (len(w) > 2 or w.isdigit()) and w not in SPANISH_STOPWORDS
+        ]
         if not meaningful_words:
             meaningful_words = raw_words
 
@@ -200,9 +203,11 @@ class HybridRetriever:
         """
         start_time = time.perf_counter()
         conn = get_db_connection(self.db_path)
-
-        lexical_candidates = self.search_lexical(conn, query, department_filter, limit=25)
-        vector_candidates = self.search_vector(conn, query, department_filter, limit=25)
+        try:
+            lexical_candidates = self.search_lexical(conn, query, department_filter, limit=25)
+            vector_candidates = self.search_vector(conn, query, department_filter, limit=25)
+        finally:
+            conn.close()
 
         fused_scores: Dict[int, Dict[str, Any]] = {}
         K = RRF_K_CONSTANT
@@ -253,8 +258,6 @@ class HybridRetriever:
                     "rrf_score": vector_rrf,
                     "modalities": ["dense_vector"]
                 }
-
-        conn.close()
 
         sorted_chunks = sorted(fused_scores.values(), key=lambda x: x["rrf_score"], reverse=True)
         top_results = sorted_chunks[:top_k]

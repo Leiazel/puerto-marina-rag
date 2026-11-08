@@ -64,6 +64,10 @@ async function loadStats() {
             document.getElementById("stat-chunks").textContent = data.stats.chunks_count;
             document.getElementById("stat-players").textContent = data.stats.players_count;
             document.getElementById("stat-latency").textContent = `${data.stats.average_query_latency_ms} ms`;
+            const modeEl = document.getElementById("stat-mode");
+            if (modeEl && data.stats.synthesis_mode) {
+                modeEl.textContent = data.stats.synthesis_mode;
+            }
         }
     } catch (e) {
         console.warn("Could not load stats:", e);
@@ -171,13 +175,17 @@ function formatMarkdown(mdText) {
     if (!mdText) return "";
     let html = mdText
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/^---+$/gim, '<hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.12); margin: 1rem 0;">')
         .replace(/^#### (.*$)/gim, '<h4>$1</h4>')
         .replace(/^### (.*$)/gim, '<h3>$1</h3>')
         .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+        .replace(/^# (.*$)/gim, '<h3>$1</h3>')
+        .replace(/^\s*[-*]\s+(.*$)/gim, '<li>$1</li>')
+        .replace(/^\s*\d+\.\s+(.*$)/gim, '<li>$1</li>')
         .replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>')
-        .replace(/\*(.*?)\*/gim, '<em>$1</em>')
+        .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/gim, '<em>$1</em>')
         .replace(/`([^`]+)`/gim, '<code>$1</code>')
-        .replace(/^\s*-\s+(.*$)/gim, '<li>$1</li>');
+        .replace(/\[REF:\s*([^\]]+)\]/gim, '<span class="badge badge-gold" style="font-size:0.7rem;">REF: $1</span>');
 
     // Group consecutive <li> elements into a single <ul>
     html = html.replace(/(?:<li>.*?<\/li>\s*)+/gm, (match) => `<ul>${match}</ul>`);

@@ -1,22 +1,32 @@
 """
-Generator module for Grounded Response Generation and Citations (v2.0).
+Generator module for Grounded Response Generation and Citations (v2.1).
 Features:
 1. Upgraded Local Extractive Synthesizer (preserves table headers, scores lines by relevance,
    and computes dynamic confidence based on cosine similarity and modality overlap).
-2. Universal OpenAI-compatible LLM Adapter (ready for Ollama, Groq, Gemini, or OpenAI).
+2. Universal OpenAI-compatible LLM Adapter (Ollama, Groq, Gemini, OpenAI) with:
+   - Live .env reload support
+   - Detailed HTTP error diagnostics
+   - Automatic model discovery & fallback on HTTP 404 (model_not_found)
+   - Reasoning tag (<think>...</think>) cleanup
 """
 import json
 import re
+import time
 import unicodedata
 import urllib.request
-from typing import List, Dict, Any
+import urllib.error
+from typing import List, Dict, Any, Optional
 
 from src.config import (
+    ENV_FILE,
+    _load_env_file,
+    _resolve_llm_config,
     USE_EXTERNAL_LLM,
     LLM_API_BASE,
     LLM_API_KEY,
     LLM_MODEL,
     LLM_TIMEOUT_SEC,
+    GROQ_FALLBACK_MODELS,
     SPANISH_STOPWORDS
 )
 
@@ -28,13 +38,79 @@ def _strip_accents(text: str) -> str:
     )
 
 
+def _clean_llm_output(text: str) -> str:
+    """Strips internal <think>...</think> reasoning blocks if emitted by reasoning models."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    return cleaned or text.strip()
+
+
 class GroundedGenerator:
     def __init__(self):
+        self._env_mtime: float = 0.0
         self.use_llm = USE_EXTERNAL_LLM or bool(LLM_API_KEY)
         self.api_base = LLM_API_BASE
         self.api_key = LLM_API_KEY
         self.model = LLM_MODEL
         self.timeout = LLM_TIMEOUT_SEC
+        self.last_error: Optional[str] = None
+        self._refresh_config_if_needed(force=True)
+
+    def _refresh_config_if_needed(self, force: bool = False) -> None:
+        """Hot-reloads .env if the file was modified since last check."""
+        try:
+            if ENV_FILE.exists():
+                mtime = ENV_FILE.stat().st_mtime
+                if force or mtime > self._env_mtime:
+                    self._env_mtime = mtime
+                    # Reload key-values from .env with override
+                    try:
+                        from dotenv import load_dotenv
+                        load_dotenv(dotenv_path=ENV_FILE, override=True)
+                    except ImportError:
+                        _load_env_file(ENV_FILE)
+                    use_ext, base, key, model, timeout = _resolve_llm_config()
+                    self.use_llm = use_ext or bool(key)
+                    self.api_base = base
+                    self.api_key = key
+                    self.model = model
+                    self.timeout = timeout
+        except Exception:
+            pass
+
+    def _discover_fallback_model(self) -> Optional[str]:
+        """
+        Queries GET {api_base}/models to auto-select a valid chat model
+        when the configured model returns HTTP 404 (model_not_found).
+        """
+        if not self.api_key:
+            return None
+        req = urllib.request.Request(
+            f"{self.api_base}/models",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "PuertoMarinaRAG/2.1"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                available = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+                if not available:
+                    return None
+                # 1. Prefer curated chat models in priority order
+                for candidate in GROQ_FALLBACK_MODELS:
+                    if candidate in available and candidate != self.model:
+                        return candidate
+                # 2. Otherwise pick any text/chat model (exclude whisper, guard, tts/orpheus, embeddings)
+                excluded_keywords = ("whisper", "guard", "orpheus", "tts", "embed", "moderation")
+                for m_id in available:
+                    if m_id != self.model and not any(k in m_id.lower() for k in excluded_keywords):
+                        return m_id
+        except Exception:
+            return None
+        return None
 
     def build_prompt_context(self, chunks: List[Dict[str, Any]]) -> str:
         """Constructs formatted context block with clear citation IDs."""
@@ -78,6 +154,8 @@ class GroundedGenerator:
         retrieved_chunks: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Generates a structured, evidence-grounded answer."""
+        self._refresh_config_if_needed()
+
         if not retrieved_chunks:
             return {
                 "answer": "No se encontraron documentos o registros relevantes en la base de datos del club para responder a esta consulta.",
@@ -87,10 +165,52 @@ class GroundedGenerator:
             }
 
         if self.use_llm and self.api_key:
-            try:
-                return self._call_external_llm(query, retrieved_chunks)
-            except Exception as e:
-                print(f"Warning: external LLM call failed ({e}), falling back to local grounded synthesis.")
+            max_retries = 3
+            tried_fallback_model = False
+
+            for attempt in range(max_retries):
+                try:
+                    res = self._call_external_llm(query, retrieved_chunks)
+                    self.last_error = None
+                    return res
+                except urllib.error.HTTPError as e:
+                    err_body = ""
+                    try:
+                        err_body = e.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+
+                    # Rate limit (HTTP 429): exponential backoff
+                    if e.code == 429 and attempt < max_retries - 1:
+                        retry_after = e.headers.get("Retry-After")
+                        wait_sec = float(retry_after) if retry_after else (2 ** (attempt + 1))
+                        time.sleep(wait_sec)
+                        continue
+
+                    # Model not found or deprecated (HTTP 404 / 400 model_not_found): auto-discover valid model
+                    if e.code in (404, 400) and not tried_fallback_model and (
+                        "model_not_found" in err_body or "does not exist" in err_body or e.code == 404
+                    ):
+                        tried_fallback_model = True
+                        fallback_model = self._discover_fallback_model()
+                        if fallback_model:
+                            print(
+                                f"Notice: model '{self.model}' returned HTTP {e.code}. "
+                                f"Auto-switching to available provider model '{fallback_model}'."
+                            )
+                            self.model = fallback_model
+                            continue
+
+                    self.last_error = f"HTTP {e.code}: {err_body or e.reason}"
+                    print(
+                        f"Warning: external LLM call to {self.api_base} (model={self.model}) "
+                        f"failed with {self.last_error}. Falling back to local grounded synthesis."
+                    )
+                    break
+                except Exception as e:
+                    self.last_error = str(e)
+                    print(f"Warning: external LLM call failed ({e}), falling back to local grounded synthesis.")
+                    break
 
         return self._local_grounded_synthesis(query, retrieved_chunks)
 
@@ -259,20 +379,23 @@ class GroundedGenerator:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.1
+            "temperature": 0.1,
+            "max_tokens": 1000
         }
 
         req = urllib.request.Request(
             f"{self.api_base}/chat/completions",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "PuertoMarinaRAG/2.1"
             },
             data=json.dumps(payload).encode("utf-8")
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            answer_text = data["choices"][0]["message"]["content"]
+            raw_answer = data["choices"][0]["message"]["content"]
+            answer_text = _clean_llm_output(raw_answer)
 
         citations = [
             {
@@ -292,3 +415,57 @@ class GroundedGenerator:
             "confidence": self._compute_dynamic_confidence(chunks),
             "model_used": f"llm:{self.model}"
         }
+
+    def check_llm_health(self) -> Dict[str, Any]:
+        """Verifies connectivity and model availability against the configured LLM server."""
+        self._refresh_config_if_needed()
+        if not self.use_llm or not self.api_key:
+            return {
+                "enabled": False,
+                "status": "local_only",
+                "model": "grounded_extractive_v2",
+                "api_base": None
+            }
+
+        req = urllib.request.Request(
+            f"{self.api_base}/models",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "PuertoMarinaRAG/2.1"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = sorted([m.get("id", "") for m in data.get("data", []) if m.get("id")])
+                model_valid = self.model in models if models else True
+                return {
+                    "enabled": True,
+                    "status": "connected" if model_valid else "model_mismatch",
+                    "configured_model": self.model,
+                    "model_available": model_valid,
+                    "api_base": self.api_base,
+                    "available_models_count": len(models),
+                    "available_models": models[:15]
+                }
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            return {
+                "enabled": True,
+                "status": "error",
+                "configured_model": self.model,
+                "api_base": self.api_base,
+                "error": f"HTTP {e.code}: {body or e.reason}"
+            }
+        except Exception as e:
+            return {
+                "enabled": True,
+                "status": "error",
+                "configured_model": self.model,
+                "api_base": self.api_base,
+                "error": str(e)
+            }

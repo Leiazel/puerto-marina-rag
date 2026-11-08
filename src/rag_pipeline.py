@@ -1,12 +1,11 @@
 """
-End-to-end RAG Pipeline orchestrator for Club Atlético Puerto Marina.
-Coordinates retrieval, ranking, grounded generation, and SQLite audit logging.
+End-to-end RAG Pipeline orchestrator for Club Atlético Puerto Marina (v2.0).
+Coordinates hybrid retrieval, grounded generation, and SQLite audit logging.
 """
 import time
-import sqlite3
 from typing import Dict, Any, Optional
 
-from src.config import DB_PATH, DEFAULT_TOP_K, DEFAULT_HYBRID_ALPHA
+from src.config import DB_PATH, DEFAULT_TOP_K, DEFAULT_HYBRID_ALPHA, USE_EXTERNAL_LLM, LLM_MODEL, LLM_API_KEY
 from src.database import get_db_connection
 from src.retriever import HybridRetriever
 from src.generator import GroundedGenerator
@@ -25,15 +24,9 @@ class ClubRAGPipeline:
         top_k: int = DEFAULT_TOP_K,
         alpha: float = DEFAULT_HYBRID_ALPHA
     ) -> Dict[str, Any]:
-        """
-        Executes end-to-end RAG:
-        1. Hybrid Retrieval (Lexical BM25 + Dense Vectors + RRF).
-        2. Grounded Generation with exact citations.
-        3. Audit logging in SQLite.
-        """
+        """Executes end-to-end Hybrid RAG + Grounded Synthesis + Audit Logging."""
         pipeline_start = time.perf_counter()
 
-        # Step 1: Retrieve relevant chunks
         retrieval_output = self.retriever.hybrid_search(
             query=query,
             department_filter=department_filter,
@@ -44,14 +37,12 @@ class ClubRAGPipeline:
         retrieval_time_ms = retrieval_output["retrieval_ms"]
         results = retrieval_output["results"]
 
-        # Step 2: Generate grounded answer
         gen_start = time.perf_counter()
         gen_output = self.generator.generate_grounded_answer(query, results)
         gen_time_ms = round((time.perf_counter() - gen_start) * 1000.0, 2)
 
         total_time_ms = round((time.perf_counter() - pipeline_start) * 1000.0, 2)
 
-        # Step 3: Log query into SQLite audit table
         top_sim = results[0]["cosine_sim"] if results else 0.0
         self._log_query(
             query=query,
@@ -88,7 +79,6 @@ class ClubRAGPipeline:
         retrieval_ms: float,
         total_ms: float
     ) -> None:
-        """Stores query details into SQLite audit log."""
         try:
             conn = get_db_connection(self.db_path)
             conn.execute("""
@@ -104,7 +94,6 @@ class ClubRAGPipeline:
             print(f"Warning: could not write to query_logs ({e})")
 
     def get_stats(self) -> Dict[str, Any]:
-        """Returns statistics about the knowledge base and performance."""
         conn = get_db_connection(self.db_path)
         cur = conn.cursor()
 
@@ -114,11 +103,10 @@ class ClubRAGPipeline:
         staff_count = cur.execute("SELECT count(*) FROM staff").fetchone()[0]
         dept_count = cur.execute("SELECT count(*) FROM departments").fetchone()[0]
         queries_count = cur.execute("SELECT count(*) FROM query_logs").fetchone()[0]
-        
+
         avg_latency_row = cur.execute("SELECT avg(total_ms) FROM query_logs").fetchone()[0]
         avg_latency = round(avg_latency_row, 2) if avg_latency_row else 0.0
 
-        # Department breakdown
         dept_docs = cur.execute("""
             SELECT d.id, d.name, count(doc.id) as doc_count
             FROM departments d
@@ -128,6 +116,7 @@ class ClubRAGPipeline:
 
         conn.close()
 
+        llm_active = USE_EXTERNAL_LLM or bool(LLM_API_KEY)
         return {
             "documents_count": docs_count,
             "chunks_count": chunks_count,
@@ -136,5 +125,6 @@ class ClubRAGPipeline:
             "departments_count": dept_count,
             "total_queries_logged": queries_count,
             "average_query_latency_ms": avg_latency,
+            "synthesis_mode": f"LLM ({LLM_MODEL})" if llm_active else "Local Grounded Synthesizer v2",
             "departments": [dict(r) for r in dept_docs]
         }

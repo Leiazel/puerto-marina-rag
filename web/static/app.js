@@ -1,11 +1,8 @@
-// Frontend JavaScript for Club Atlético Puerto Marina RAG
+// Frontend JavaScript for Club Atlético Puerto Marina RAG (v2.0)
 
 const API_BASE = "";
-
-// State
 let currentAlpha = 0.5;
 
-// Initialize
 document.addEventListener("DOMContentLoaded", () => {
     initNavigation();
     initControls();
@@ -16,14 +13,13 @@ document.addEventListener("DOMContentLoaded", () => {
     loadLogs();
 });
 
-// Navigation
 function initNavigation() {
     const navButtons = document.querySelectorAll(".nav-btn");
     navButtons.forEach(btn => {
         btn.addEventListener("click", () => {
             navButtons.forEach(b => b.classList.remove("active"));
             document.querySelectorAll(".tab-pane").forEach(p => p.classList.remove("active"));
-            
+
             btn.classList.add("active");
             const targetId = btn.getAttribute("data-tab");
             document.getElementById(targetId).classList.add("active");
@@ -35,7 +31,6 @@ function initNavigation() {
     });
 }
 
-// Controls
 function initControls() {
     const alphaSlider = document.getElementById("alpha-slider");
     const alphaValueLabel = document.getElementById("alpha-val");
@@ -54,14 +49,12 @@ function initControls() {
         });
     }
 
-    // Ingestion Form
     const ingestForm = document.getElementById("ingest-form");
     if (ingestForm) {
         ingestForm.addEventListener("submit", handleIngestSubmit);
     }
 }
 
-// Stats
 async function loadStats() {
     try {
         const res = await fetch(`${API_BASE}/api/status`);
@@ -77,15 +70,12 @@ async function loadStats() {
     }
 }
 
-// Query Execution
 async function executeQuery(presetQuery = null) {
     const input = document.getElementById("query-input");
     const query = presetQuery || input.value.trim();
     if (!query) return;
 
-    if (presetQuery) {
-        input.value = presetQuery;
-    }
+    if (presetQuery) input.value = presetQuery;
 
     const deptFilter = document.getElementById("dept-filter").value || null;
     const topK = parseInt(document.getElementById("top-k-select").value) || 4;
@@ -111,7 +101,7 @@ async function executeQuery(presetQuery = null) {
 
         const data = await res.json();
         renderResult(data);
-        loadStats(); // refresh log count & latency
+        loadStats();
     } catch (err) {
         alert("Error al ejecutar la consulta: " + err.message);
     } finally {
@@ -120,31 +110,29 @@ async function executeQuery(presetQuery = null) {
     }
 }
 
-// Render Query Result
 function renderResult(data) {
     const resultCard = document.getElementById("result-card");
     const answerEl = document.getElementById("answer-content");
     const telemetryEl = document.getElementById("telemetry-badges");
     const chunksEl = document.getElementById("chunks-container");
 
-    // Telemetry
     telemetryEl.innerHTML = `
         <span class="badge badge-info">⏱️ Total: ${data.timings.total_ms} ms</span>
         <span class="badge badge-success">🔍 Búsqueda: ${data.timings.retrieval_ms} ms</span>
-        <span class="badge badge-gold">🧠 Síntesis: ${data.timings.generation_ms} ms</span>
+        <span class="badge badge-gold">🧠 Motor: ${data.model_used} (${data.timings.generation_ms} ms)</span>
         <span class="badge badge-info">🎯 Confianza: ${Math.round(data.confidence * 100)}%</span>
     `;
 
-    // Markdown Answer rendering
     answerEl.innerHTML = formatMarkdown(data.answer);
 
-    // Chunks Accordion
     chunksEl.innerHTML = "";
     data.retrieved_chunks.forEach((ch, idx) => {
         const chunkDiv = document.createElement("div");
         chunkDiv.className = "chunk-card";
-        
-        const modalities = ch.modalities.map(m => `<span class="badge badge-gold">${m === "lexical" ? "BM25 FTS5" : "Vector Denso"}</span>`).join(" ");
+
+        const modalities = ch.modalities
+            .map(m => `<span class="badge badge-gold">${m === "lexical" ? "BM25 FTS5" : "Vector Denso"}</span>`)
+            .join(" ");
 
         chunkDiv.innerHTML = `
             <div class="chunk-header" onclick="toggleChunk(${idx})">
@@ -161,7 +149,7 @@ function renderResult(data) {
                 </div>
             </div>
             <div class="chunk-body" id="chunk-body-${idx}" style="display: ${idx === 0 ? 'block' : 'none'};">
-                ${ch.match_snippet ? `<p style="margin-bottom: 8px; color: #f59e0b;"><strong>Coincidencia Lexical:</strong> ${ch.match_snippet}</p>` : ''}
+                ${ch.match_snippet ? `<p style="margin-bottom: 8px; color: #f59e0b;"><strong>Coincidencia Léxica:</strong> ${ch.match_snippet}</p>` : ''}
                 ${escapeHtml(ch.content)}
             </div>
         `;
@@ -179,24 +167,23 @@ function toggleChunk(idx) {
     }
 }
 
-// Markdown formatter helper
 function formatMarkdown(mdText) {
     if (!mdText) return "";
     let html = mdText
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/^#### (.*$)/gim, '<h4>$1</h4>')
         .replace(/^### (.*$)/gim, '<h3>$1</h3>')
         .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-        .replace(/^#### (.*$)/gim, '<h4>$1</h4>')
         .replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>')
         .replace(/\*(.*?)\*/gim, '<em>$1</em>')
         .replace(/`([^`]+)`/gim, '<code>$1</code>')
         .replace(/^\s*-\s+(.*$)/gim, '<li>$1</li>');
 
-    // Wrap list items
-    html = html.replace(/(<li>[\s\S]*?<\/li>)/gm, '<ul>$1</ul>');
-    
-    // Process markdown tables
-    html = html.replace(/(\|.+\|\n)+/gm, (match) => {
+    // Group consecutive <li> elements into a single <ul>
+    html = html.replace(/(?:<li>.*?<\/li>\s*)+/gm, (match) => `<ul>${match}</ul>`);
+
+    // Render Markdown tables
+    html = html.replace(/(\|.+\|\n?)+/gm, (match) => {
         const rows = match.trim().split("\n");
         let tableHtml = "<table>";
         rows.forEach((row, i) => {
@@ -221,7 +208,6 @@ function escapeHtml(str) {
     return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Load Players Roster
 async function loadPlayers() {
     const container = document.getElementById("players-grid");
     if (!container) return;
@@ -257,11 +243,10 @@ async function loadPlayers() {
 
 function queryPlayer(playerName) {
     document.querySelector('.nav-btn[data-tab="tab-query"]').click();
-    document.getElementById("query-input").value = `¿Cuál es el estado físico, médico o informe sobre ${playerName}?`;
+    document.getElementById("query-input").value = `¿Cuál es el estado físico, médico, peso y altura de ${playerName}?`;
     executeQuery();
 }
 
-// Load Documents
 async function loadDocuments() {
     const tableBody = document.getElementById("docs-table-body");
     if (!tableBody) return;
@@ -286,7 +271,6 @@ async function loadDocuments() {
     }
 }
 
-// Load Staff
 async function loadStaff() {
     const container = document.getElementById("staff-grid");
     if (!container) return;
@@ -315,7 +299,6 @@ async function loadStaff() {
     }
 }
 
-// Load Logs
 async function loadLogs() {
     const tableBody = document.getElementById("logs-table-body");
     if (!tableBody) return;
@@ -340,7 +323,6 @@ async function loadLogs() {
     }
 }
 
-// Handle Ingest Form Submit
 async function handleIngestSubmit(e) {
     e.preventDefault();
     const btn = document.getElementById("ingest-submit-btn");
@@ -364,7 +346,7 @@ async function handleIngestSubmit(e) {
             body: JSON.stringify(payload)
         });
         const data = await res.json();
-        alert(`Éxito: ${data.message} (${data.chunks_created} fragmentos generados con FastEmbed)`);
+        alert(`Éxito: ${data.message} (${data.chunks_created} fragmentos generados)`);
         document.getElementById("ingest-form").reset();
         loadStats();
         loadDocuments();

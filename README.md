@@ -1,8 +1,26 @@
-# ⚽ Club Atlético Puerto Marina - Sistema RAG de Alto Rendimiento
+# ⚽ Club Atlético Puerto Marina - Sistema RAG Híbrido (v2.0 Optimizada)
 
-Sistema integral de **Generación Aumentada por Recuperación (RAG)** de punta a punta, diseñado para la gestión operativa, biomédica, táctica y logística de un club de fútbol profesional.
+Sistema integral de **Generación Aumentada por Recuperación (RAG)** de grado productivo para la gestión operativa, biomédica, táctica y logística de un club de fútbol profesional.
 
-Desarrollado con una arquitectura optimizada para consultas basada en **SQLite Híbrido** (**FTS5** con ranking **BM25** para búsqueda léxica exacta + almacenamiento binario en **BLOB** de vectores densos multilingües con **FastEmbed ONNX** + fusión de rankings mediante **Reciprocal Rank Fusion (RRF)**).
+Arquitectura optimizada basada en **SQLite Híbrido** (**FTS5** con ranking **BM25** y filtrado de *stopwords* en español + almacenamiento binario en **BLOB** de vectores densos multilingües con **FastEmbed ONNX** + búsqueda vectorial en dos fases + fusión de rankings mediante **Reciprocal Rank Fusion (RRF)**).
+
+---
+
+## 🛠️ Novedades y Optimizaciones de la Versión 2.0
+
+1. **Filtrado de *Stopwords* y Normalización de Diacríticos en Español para FTS5 (`src/retriever.py`):**
+   Elimina conectores vacíos (*"como"*, *"cual"*, *"para"*, *"los"*, *"del"*, etc.) y normaliza tildes antes de armar la consulta `MATCH` en SQLite FTS5. Esto previene falsos positivos y maximiza la precisión de BM25.
+2. **Búsqueda Vectorial en Dos Fases con Reducción Drástica de I/O (`src/retriever.py`):**
+   - **Fase 1:** Carga únicamente los pares `(id, embedding)` (blobs binarios compactos de 1.536 bytes) y ejecuta el producto punto matricial en BLAS/C.
+   - **Fase 2:** Recupera el texto completo y metadatos **únicamente de los fragmentos Top-K ganadores**.
+3. **Puente Relacional SQL-a-RAG (`src/ingestion.py`):**
+   Las tablas estructuradas `players` y `staff` se sincronizan automáticamente como documentos virtuales vectorizados. Permite consultar directamente datos de contacto, teléfonos, pesos, estaturas y dorsales.
+4. **Sintetizador Extractivo con Preservación de Tablas y Confianza Dinámica (`src/generator.py`):**
+   Reconstruye encabezados de tablas Markdown y calcula un índice de confianza dinámico según el acuerdo inter-modal (BM25 + Coseno).
+5. **Adaptador Universal para LLMs (`src/config.py` y `src/generator.py`):**
+   Funciona 100% de forma local/offline o se conecta a cualquier LLM compatible con OpenAI (Ollama, Groq, Gemini, OpenAI) configurando variables de entorno (`USE_EXTERNAL_LLM`, `LLM_API_BASE`, `LLM_API_KEY`, `LLM_MODEL`).
+6. **Suite Ampliada a 10 Pruebas Unitarias Automatizadas (`tests/test_rag.py`):**
+   Cobertura completa del motor híbrido, normalización, puente relacional y auditoría.
 
 ---
 
@@ -17,8 +35,8 @@ Desarrollado con una arquitectura optimizada para consultas basada en **SQLite H
                     ▼                                                   ▼
      ┌─────────────────────────────┐                    ┌───────────────────────────────┐
      │  Búsqueda Léxica Exacta     │                    │  Búsqueda Semántica Densa     │
-     │  SQLite FTS5 + BM25         │                    │  FastEmbed ONNX (384 dims)    │
-     │  (Nombres, códigos, reglas) │                    │  NumPy Matrix Cosine Dot      │
+     │  SQLite FTS5 + BM25         │                    │  Fase 1: BLOBs IDs + Coseno   │
+     │  (Stopwords limpiadas)      │                    │  Fase 2: Hidratación Top-K    │
      └──────────────┬──────────────┘                    └───────────────┬───────────────┘
                     │                                                   │
                     └─────────────────────────┬─────────────────────────┘
@@ -37,7 +55,7 @@ Desarrollado con una arquitectura optimizada para consultas basada en **SQLite H
                                               ▼
                                ┌─────────────────────────────┐
                                │  Generador de Síntesis      │
-                               │  con Citas de Evidencia     │
+                               │  (Local o LLM Universal)    │
                                └──────────────┬──────────────┘
                                               │
                                               ▼
@@ -57,76 +75,72 @@ Desarrollado con una arquitectura optimizada para consultas basada en **SQLite H
 ### Departamentos y Servicios Reales Modelados
 1. **Departamento Médico y Fisioterapia:**
    - *Responsables:* Dr. Federico Arismendi (Jefe Médico) y Lic. Valentina Russo (Kinesióloga).
-   - Partes médicos semanales, resonancias en Centro Rossi, protocolos de 5 fases de Retorno al Juego (Return To Play - RTP), crioterapia con GameReady y diatermia Indiba.
+   - Partes médicos, evolución de lesiones (**Lautaro Carrizo #6**, **Franco Valenzuela #7**), protocolo de 5 fases de Retorno al Juego (Return To Play - RTP).
 2. **Preparación Física y Monitoreo GPS:**
    - *Responsable:* Prof. Germán Silveira.
-   - Datos de dispositivos Catapult Vector S7, distancias totales, High Speed Running (> 19.8 km/h), sprints (> 25.2 km/h), PlayerLoad, ratio de carga aguda:crónica (ACWR) con detección de banderas rojas (> 1.45), y test de fatiga neuromuscular de salto CMJ en plataforma Chronojump.
+   - Datos de dispositivos Catapult Vector S7, distancias totales, High Speed Running (> 19.8 km/h), sprints (> 25.2 km/h), ratio ACWR (alerta amarilla 1.48) y test de fatiga neuromuscular CMJ.
 3. **Nutrición y Rendimiento Metabólico:**
    - *Responsable:* Lic. Sofía Carrizo (ISAK 1).
-   - Antropometría de 6 pliegues, sumatoria milimétrica, pautas de carga de glucógeno (8-10 g/kg), suplementación con creatina Creapure y cafeína anhidra, y **protocolo estricto Sin TACC para el futbolista celíaco Agustín Ríos (#14)**.
+   - Antropometría mensual de 6 pliegues, pautas de glucógeno y suplementación, y **protocolo estricto Sin TACC para Agustín Ríos (#14)**.
 4. **Cuerpo Técnico y Análisis Táctico:**
-   - *Responsables:* Javier Méndez (Director Técnico) y Pablo D'Angelo (Asistente / Analista).
-   - Microciclos estructurados semanales (MD-4 a MD+1), informes tácticos y de video del próximo rival (*Club Deportivo Los Andes* y neutralización de su extremo Benegas), diseño de balón parado ofensivo ("Alfa Marina") y defensivo, informes del árbitro Pitres y alineación oficial para semifinales.
+   - *Responsables:* Javier Méndez (DT) y Pablo D'Angelo (AT).
+   - Microciclos semanales (MD-4 a MD+1), scouting del rival *Club Deportivo Los Andes*, balón parado *"Alfa Marina"*, informe del árbitro Pitres y alineación oficial para semifinales.
 5. **Scouting e Inteligencia Deportiva:**
    - *Responsable:* Lucas Benítez.
-   - Informes de seguimiento con percentiles avanzados (Wyscout / StatsBomb) para fichajes (Rodrigo "Chelo" Vargas) y análisis comparativo de goles esperados (xG/xA) entre los delanteros Santos (#11) y Cáceres (#9).
+   - Fichas de seguimiento para fichajes (Rodrigo "Chelo" Vargas) y comparativa de efectividad ofensiva Santos vs Cáceres (xG/xA).
 6. **Operaciones, Logística y Viajes:**
    - *Responsable:* Carlos "Charly" Pereyra.
-   - Plan operativo de semifinal: vuelo chárter AndesJet AR-4912, alojamiento en Hotel Grand Bahía (pisos 4 y 5 exclusivos), distribución de habitaciones y acondicionamiento de la Hab. 402 como Gabinete Médico con crioterapia.
+   - Plan operativo de semifinal: vuelo chárter AndesJet AR-4912, Hotel Grand Bahía (pisos 4 y 5 exclusivos), y acondicionamiento de Hab. 402 como gabinete médico y crioterapia.
 7. **Prensa, Comunicación y Reglamento Interno:**
    - *Responsable:* Mariana Gómez Solís.
-   - Protocolos de zona mixta, temas prohibidos (arbitraje y rumores de fichajes), y código interno de disciplina con régimen de multas económicas en dólares (retrasos, sobrepeso en el pesaje matutino de los viernes y prohibición de celulares en vestuarios y comedores).
+   - Protocolos de zona mixta, temas restringidos y **Reglamento Interno de Disciplina** con multas en USD (retrasos, pesaje de los viernes y celulares en vestuario).
 
 ---
 
-## ⚡ ¿Por qué SQLite es la Opción Óptima para este Sistema RAG?
+## 🚀 Instalación y Puesta en Marcha
 
-1. **Cero Daemons Externos y Resiliencia Total:** Sin necesidad de procesos de fondo frágiles o servicios pesados en memoria; SQLite opera dentro del proceso Python con latencias de acceso a disco en microsegundos vía WAL (*Write-Ahead Logging*).
-2. **FTS5 Integrado de Clase Mundial:** Soporta tokenización `unicode61 remove_diacritics 2`, permitiendo que términos en español con y sin tilde (*"médico"* vs *"medico"*, *"nutrición"* vs *"nutricion"*) coincidan con exactitud matemática mediante el algoritmo **BM25**.
-3. **Almacenamiento Vectorial Compacto y BLAS Vectorizado:** Los embeddings de 384 dimensiones de FastEmbed se almacenan como `BLOB` (1.536 bytes por chunk). La similitud de coseno sobre cientos de fragmentos se resuelve en una sola multiplicación matricial C/BLAS de NumPy en **menos de 1 milisegundo**.
-4. **Fusión de Rangos Recíprocos (RRF):**
-   $$RRF(d) = \frac{\alpha}{60 + rank_{lexical}(d)} + \frac{1 - \alpha}{60 + rank_{vector}(d)}$$
-   Permite encontrar tanto códigos y números exactos (ej: *#6*, *ACWR 1.48*, *Sin TACC*, *AR-4912*) como conceptos semánticos abstractos (ej: *"jugador cansado tras el partido"*).
-
----
-
-## 🚀 Puesta en Marcha Rápida
-
-### 1. Entorno Virtual y Dependencias
-El proyecto utiliza un entorno virtual Python con dependencias ultra-rápidas instaladas (`fastembed`, `fastapi`, `uvicorn`, `numpy`, `scikit-learn`):
+### 1. Dependencias
 ```bash
-# Activar entorno
-source /home/antigravity/rag_env/bin/activate
+pip install -r requirements.txt
 ```
 
-### 2. Iniciar el Servidor Web & API
+### 2. Configuración Opcional (`.env`)
+Copiar plantilla de entorno:
 ```bash
-/home/antigravity/club_rag/run_server.sh
+cp .env.example .env
 ```
-El servidor quedará disponible en:
+Por defecto, `USE_EXTERNAL_LLM=false` utiliza el sintetizador local extractivo de alto rendimiento (0 costo, 0 dependencias). Si deseas activar un LLM (Ollama, Groq, Gemini u OpenAI), edita `.env`.
+
+### 3. Iniciar el Servidor Web & API
+```bash
+./run_server.sh
+```
 - **Consola Web:** [http://127.0.0.1:8000](http://127.0.0.1:8000)
 - **Documentación Swagger:** [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
-### 3. Consultas Directas por Terminal (CLI)
+### 4. Consultas por Terminal (CLI)
 ```bash
 # Consulta puntual
-PYTHONPATH=/home/antigravity/club_rag /home/antigravity/rag_env/bin/python src/cli.py --query "¿Cuál es la lesión de Lautaro Carrizo y cuándo vuelve?"
+PYTHONPATH=. python src/cli.py --query "¿Cuál es la lesión de Lautaro Carrizo y cuándo vuelve a jugar?"
 
-# Consulta con filtro de departamento
-PYTHONPATH=/home/antigravity/club_rag /home/antigravity/rag_env/bin/python src/cli.py --dept preparacion_fisica --query "¿Qué jugador tiene alerta de fatiga en el GPS?"
+# Consulta con filtro por departamento
+PYTHONPATH=. python src/cli.py --dept preparacion_fisica --query "¿Qué jugador tiene alerta de fatiga en el GPS?"
 
-# Ver estadísticas de la base de conocimiento
-PYTHONPATH=/home/antigravity/club_rag /home/antigravity/rag_env/bin/python src/cli.py --stats
+# Consulta de datos relacionales indexados
+PYTHONPATH=. python src/cli.py --query "¿Cuál es el correo y teléfono de la nutricionista Sofía Carrizo?"
 
-# Modo interactivo tipo chat
-PYTHONPATH=/home/antigravity/club_rag /home/antigravity/rag_env/bin/python src/cli.py --interactive
+# Estadísticas del sistema
+PYTHONPATH=. python src/cli.py --stats
+
+# Modo interactivo
+PYTHONPATH=. python src/cli.py --interactive
 ```
 
-### 4. Ejecución del Test Suite Automatizado
+### 5. Suite de Pruebas Automatizadas
 ```bash
-PYTHONPATH=/home/antigravity/club_rag /home/antigravity/rag_env/bin/python tests/test_rag.py
+PYTHONPATH=. python tests/test_rag.py
 ```
-*(9 pruebas unitarias que validan esquema, FTS5 BM25, embeddings, coseno, RRF, filtros y citas).*
+*(10 pruebas unitarias que validan esquema, FTS5 BM25, embeddings, 2-phase vector search, RRF, filtros departamentales, puente SQL-RAG y telemetría).*
 
 ---
 
@@ -134,8 +148,8 @@ PYTHONPATH=/home/antigravity/club_rag /home/antigravity/rag_env/bin/python tests
 
 | Método | Endpoint | Descripción |
 |---|---|---|
-| `GET` | `/api/status` | Estado del sistema, recuentos de documentos, chunks y latencias |
-| `POST` | `/api/query` | Ejecución de consulta RAG híbrida con citas y fragmentos |
+| `GET` | `/api/status` | Estado del sistema, recuentos de documentos, chunks, estado del LLM y latencias |
+| `POST` | `/api/query` | Ejecución de consulta RAG híbrida con citas, fragmentos y confianza dinámica |
 | `GET` | `/api/documents` | Listado de documentos y desglose por departamento |
 | `GET` | `/api/documents/{id}` | Contenido completo de un documento y sus chunks |
 | `POST` | `/api/documents` | Ingesta dinámica de nuevos partes o reportes en tiempo real |

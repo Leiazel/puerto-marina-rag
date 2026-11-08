@@ -1,10 +1,8 @@
 """
-FastAPI REST API server for Club Atlético Puerto Marina RAG System.
-Provides endpoints for queries, document management, player stats, and audit logs.
+FastAPI REST API server for Club Atlético Puerto Marina RAG System (v2.0).
 """
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -13,16 +11,15 @@ from pydantic import BaseModel, Field
 from src.config import BASE_DIR, DB_PATH
 from src.database import get_db_connection
 from src.rag_pipeline import ClubRAGPipeline
-from src.ingestion import ingest_document_file, parse_markdown_file
+from src.ingestion import ingest_document_file, run_full_ingestion
 from src.embeddings import get_embedding_engine
 
 app = FastAPI(
-    title="Club Atlético Puerto Marina - RAG Knowledge Engine",
-    description="End-to-end RAG system for football club daily operations, sports medicine, tactics, and GPS metrics.",
-    version="1.0.0"
+    title="Club Atlético Puerto Marina - RAG Knowledge Engine v2.0",
+    description="Hybrid RAG system (SQLite FTS5 BM25 + FastEmbed ONNX + RRF) for football club operations.",
+    version="2.0.0"
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,12 +32,11 @@ pipeline = ClubRAGPipeline(db_path=DB_PATH)
 STATIC_DIR = BASE_DIR / "web" / "static"
 
 
-# Request & Response Models
 class QueryRequest(BaseModel):
     query: str = Field(..., description="Pregunta en lenguaje natural sobre el club o día a día")
-    department_filter: Optional[str] = Field(None, description="Filtro opcional por departamento (ej: servicio_medico, cuerpo_tecnico, etc.)")
+    department_filter: Optional[str] = Field(None, description="Filtro opcional por departamento")
     top_k: int = Field(4, ge=1, le=15, description="Cantidad de fragmentos a recuperar")
-    alpha: float = Field(0.5, ge=0.0, le=1.0, description="Balance Híbrido: 1.0 = sólo léxico BM25, 0.0 = sólo vector denso, 0.5 = RRF equilibrado")
+    alpha: float = Field(0.5, ge=0.0, le=1.0, description="Balance Híbrido: 1.0 = BM25, 0.0 = Vector, 0.5 = RRF")
 
 
 class IngestDocRequest(BaseModel):
@@ -53,10 +49,8 @@ class IngestDocRequest(BaseModel):
     content: str = Field(..., description="Contenido en formato Markdown con secciones")
 
 
-# Endpoints
 @app.get("/api/status")
 def get_status():
-    """Health check and system stats."""
     stats = pipeline.get_stats()
     return {
         "status": "online",
@@ -67,22 +61,25 @@ def get_status():
 
 @app.post("/api/query")
 def run_query(req: QueryRequest):
-    """Executes end-to-end hybrid RAG query with grounded answer and citations."""
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="La consulta no puede estar vacía.")
-    
-    result = pipeline.ask(
+    return pipeline.ask(
         query=req.query,
         department_filter=req.department_filter,
         top_k=req.top_k,
         alpha=req.alpha
     )
-    return result
+
+
+@app.post("/api/reindex")
+def reindex_knowledge_base():
+    """Re-runs full ingestion of Markdown files and SQL relational tables."""
+    res = run_full_ingestion()
+    return {"status": "reindexed", "details": res}
 
 
 @app.get("/api/documents")
 def list_documents(department: Optional[str] = None):
-    """Lists all registered documents in the knowledge base."""
     conn = get_db_connection(DB_PATH)
     cur = conn.cursor()
     if department:
@@ -111,7 +108,6 @@ def list_documents(department: Optional[str] = None):
 
 @app.get("/api/documents/{doc_id}")
 def get_document(doc_id: int):
-    """Retrieves document detail and all its generated chunks."""
     conn = get_db_connection(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
@@ -119,22 +115,18 @@ def get_document(doc_id: int):
     if not doc:
         conn.close()
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
-    
-    cur.execute("SELECT id, chunk_index, title, content, metadata_json FROM chunks WHERE document_id = ? ORDER BY chunk_index ASC", (doc_id,))
+
+    cur.execute(
+        "SELECT id, chunk_index, title, content, metadata_json FROM chunks WHERE document_id = ? ORDER BY chunk_index ASC",
+        (doc_id,)
+    )
     chunks = cur.fetchall()
     conn.close()
-
-    return {
-        "document": dict(doc),
-        "chunks": [dict(c) for c in chunks]
-    }
+    return {"document": dict(doc), "chunks": [dict(c) for c in chunks]}
 
 
 @app.post("/api/documents")
 def add_new_document(req: IngestDocRequest):
-    """Dynamically adds a new document, chunks it, generates embeddings, and indexes into SQLite & FTS5."""
-    import tempfile
-    
     raw_md = (
         f"---\n"
         f"id: {req.doc_code}\n"
@@ -146,14 +138,11 @@ def add_new_document(req: IngestDocRequest):
         f"---\n\n"
         f"{req.content}\n"
     )
-
-    # Save to disk
     dept_folder = BASE_DIR / "data" / "raw_documents" / req.department_id
     dept_folder.mkdir(parents=True, exist_ok=True)
     target_file = dept_folder / f"{req.doc_code}.md"
     target_file.write_text(raw_md, encoding="utf-8")
 
-    # Ingest
     conn = get_db_connection(DB_PATH)
     embedder = get_embedding_engine()
     doc_id, chunk_count = ingest_document_file(target_file, conn, embedder)
@@ -170,7 +159,6 @@ def add_new_document(req: IngestDocRequest):
 
 @app.get("/api/players")
 def list_players():
-    """Lists professional roster with physical and clinical profiles."""
     conn = get_db_connection(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT * FROM players ORDER BY dorsal ASC;")
@@ -181,7 +169,6 @@ def list_players():
 
 @app.get("/api/staff")
 def list_staff():
-    """Lists coaching and medical staff members."""
     conn = get_db_connection(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -197,7 +184,6 @@ def list_staff():
 
 @app.get("/api/departments")
 def list_departments():
-    """Lists all club departments."""
     conn = get_db_connection(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT * FROM departments ORDER BY id ASC;")
@@ -208,7 +194,6 @@ def list_departments():
 
 @app.get("/api/logs")
 def list_logs(limit: int = 15):
-    """Retrieves recent query logs with timing and retrieval count."""
     conn = get_db_connection(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT * FROM query_logs ORDER BY created_at DESC LIMIT ?;", (limit,))
@@ -217,7 +202,6 @@ def list_logs(limit: int = 15):
     return [dict(r) for r in rows]
 
 
-# Static Web UI mounting
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -226,4 +210,4 @@ if STATIC_DIR.exists():
         index_file = STATIC_DIR / "index.html"
         if index_file.exists():
             return FileResponse(str(index_file))
-        return {"message": "Puerto Marina RAG Engine is running. Static files not yet deployed."}
+        return {"message": "Puerto Marina RAG Engine v2.0 is running."}

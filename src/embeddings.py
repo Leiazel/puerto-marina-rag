@@ -12,16 +12,21 @@ if "no_proxy" in os.environ and "[::1]" in os.environ.get("no_proxy", ""):
     os.environ["no_proxy"] = clean
     os.environ["NO_PROXY"] = clean
 
+import threading
 from fastembed import TextEmbedding
 
 
 class EmbeddingEngine:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(EmbeddingEngine, cls).__new__(cls)
-            cls._instance._init_model()
+            with cls._lock:
+                if cls._instance is None:
+                    instance = super(EmbeddingEngine, cls).__new__(cls)
+                    instance._init_model()
+                    cls._instance = instance
         return cls._instance
 
     def _init_model(self):

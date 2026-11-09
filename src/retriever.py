@@ -21,16 +21,78 @@ from src.database import get_db_connection
 from src.embeddings import get_embedding_engine
 
 
+import threading
 import unicodedata
 
 def _strip_accents(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
 
 
+class VectorMatrixCache:
+    """
+    In-memory dense vector matrix cache (v3.0).
+    Eliminates redundant SQLite BLOB reads and numpy buffer deserialization on every query.
+    Auto-invalidates when chunk count or max ID changes.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def get_or_load(self, conn: sqlite3.Connection, db_key: str, dim: int) -> Dict[str, Any]:
+        cur = conn.cursor()
+        sig_row = cur.execute("SELECT count(id), coalesce(max(id), 0) FROM chunks;").fetchone()
+        sig = (sig_row[0], sig_row[1]) if sig_row else (0, 0)
+
+        with self._lock:
+            cached = self._cache.get(db_key)
+            if cached and cached["sig"] == sig:
+                return cached
+
+            # Rebuild cache
+            cur.execute("SELECT id, department_id, embedding FROM chunks ORDER BY id ASC;")
+            rows = cur.fetchall()
+            if not rows:
+                empty = {
+                    "sig": sig,
+                    "ids": np.array([], dtype=np.int64),
+                    "departments": [],
+                    "matrix": np.empty((0, dim), dtype=np.float32)
+                }
+                self._cache[db_key] = empty
+                return empty
+
+            chunk_ids = np.array([r["id"] for r in rows], dtype=np.int64)
+            dept_ids = [r["department_id"] for r in rows]
+            blobs = [r["embedding"] for r in rows]
+            matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(-1, dim)
+
+            data = {
+                "sig": sig,
+                "ids": chunk_ids,
+                "departments": dept_ids,
+                "matrix": matrix
+            }
+            self._cache[db_key] = data
+            return data
+
+    def invalidate(self, db_key: Optional[str] = None):
+        with self._lock:
+            if db_key:
+                self._cache.pop(db_key, None)
+            else:
+                self._cache.clear()
+
+
+GLOBAL_VECTOR_CACHE = VectorMatrixCache()
+
+
 class HybridRetriever:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
         self.embedder = get_embedding_engine()
+
+    def invalidate_cache(self):
+        GLOBAL_VECTOR_CACHE.invalidate(str(self.db_path))
 
     def _clean_fts_query(self, query: str) -> str:
         """
@@ -135,35 +197,40 @@ class HybridRetriever:
         limit: int = 25
     ) -> List[Dict[str, Any]]:
         """
-        Two-Phase Dense Vector Search:
-        Phase 1: Load only (id, embedding) BLOBs and compute BLAS dot product.
-        Phase 2: Fetch full text/metadata ONLY for the top `limit` chunk IDs.
+        Two-Phase Dense Vector Search with In-Memory Matrix Cache (v3.0):
+        Phase 1: Zero-disk BLAS dot product against cached normalized float32 matrix.
+        Phase 2: Fetch text & metadata ONLY for the winning Top-K IDs from SQLite.
         """
         query_vec = self.embedder.embed_text(query)
-        cur = conn.cursor()
+        dim = len(query_vec)
+        db_key = str(self.db_path)
+        cache_data = GLOBAL_VECTOR_CACHE.get_or_load(conn, db_key, dim)
 
-        # Phase 1: Lightweight scan of IDs and embedding BLOBs
-        if department_filter:
-            cur.execute("SELECT id, embedding FROM chunks WHERE department_id = ?;", (department_filter,))
-        else:
-            cur.execute("SELECT id, embedding FROM chunks;")
-
-        rows = cur.fetchall()
-        if not rows:
+        if len(cache_data["ids"]) == 0:
             return []
 
-        chunk_ids = [r["id"] for r in rows]
-        blobs = [r["embedding"] for r in rows]
+        if department_filter:
+            mask = [d == department_filter for d in cache_data["departments"]]
+            if not any(mask):
+                return []
+            sub_indices = np.where(mask)[0]
+            sub_matrix = cache_data["matrix"][sub_indices]
+            sub_ids = cache_data["ids"][sub_indices]
+            similarities = self.embedder.compute_cosine_similarity(query_vec, sub_matrix)
+            top_sub_idx = np.argsort(similarities)[::-1][:limit]
+            winning_ids = [int(sub_ids[i]) for i in top_sub_idx]
+            sim_by_id = {int(sub_ids[i]): float(similarities[i]) for i in top_sub_idx}
+        else:
+            similarities = self.embedder.compute_cosine_similarity(query_vec, cache_data["matrix"])
+            top_indices = np.argsort(similarities)[::-1][:limit]
+            winning_ids = [int(cache_data["ids"][i]) for i in top_indices]
+            sim_by_id = {int(cache_data["ids"][i]): float(similarities[i]) for i in top_indices}
 
-        dim = len(query_vec)
-        matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(-1, dim)
-        similarities = self.embedder.compute_cosine_similarity(query_vec, matrix)
-
-        top_indices = np.argsort(similarities)[::-1][:limit]
-        winning_ids = [chunk_ids[i] for i in top_indices]
-        sim_by_id = {chunk_ids[i]: float(similarities[i]) for i in top_indices}
+        if not winning_ids:
+            return []
 
         # Phase 2: Fetch text & metadata only for the winning IDs
+        cur = conn.cursor()
         placeholders = ",".join("?" for _ in winning_ids)
         cur.execute(f"""
             SELECT id, document_id, title, department_id, content, metadata_json

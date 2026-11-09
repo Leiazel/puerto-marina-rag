@@ -1,11 +1,14 @@
-// Frontend JavaScript for Club Atlético Puerto Marina RAG (v2.0)
+// Frontend JavaScript for Club Atlético Puerto Marina RAG (v3.0)
+// Complete with Multi-Format Upload, Cascading Deletion, and XSS-Hardened Rendering
 
 const API_BASE = "";
 let currentAlpha = 0.5;
+let uploadQueue = [];
 
 document.addEventListener("DOMContentLoaded", () => {
     initNavigation();
     initControls();
+    initUploadZone();
     loadStats();
     loadPlayers();
     loadDocuments();
@@ -22,11 +25,13 @@ function initNavigation() {
 
             btn.classList.add("active");
             const targetId = btn.getAttribute("data-tab");
-            document.getElementById(targetId).classList.add("active");
+            const pane = document.getElementById(targetId);
+            if (pane) pane.classList.add("active");
 
             if (targetId === "tab-logs") loadLogs();
             if (targetId === "tab-docs") loadDocuments();
             if (targetId === "tab-players") loadPlayers();
+            if (targetId === "tab-staff") loadStaff();
         });
     });
 }
@@ -53,6 +58,203 @@ function initControls() {
     if (ingestForm) {
         ingestForm.addEventListener("submit", handleIngestSubmit);
     }
+}
+
+function initUploadZone() {
+    const dropzone = document.getElementById("dropzone");
+    const fileInput = document.getElementById("file-input");
+    const uploadForm = document.getElementById("upload-form");
+
+    if (!dropzone || !fileInput || !uploadForm) return;
+
+    ["dragenter", "dragover"].forEach(eventName => {
+        dropzone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.add("dragover");
+        });
+    });
+
+    ["dragleave", "drop"].forEach(eventName => {
+        dropzone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.remove("dragover");
+        });
+    });
+
+    dropzone.addEventListener("drop", (e) => {
+        const dt = e.dataTransfer;
+        if (dt && dt.files && dt.files.length > 0) {
+            addFilesToQueue(Array.from(dt.files));
+        }
+    });
+
+    fileInput.addEventListener("change", (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+            addFilesToQueue(Array.from(e.target.files));
+            fileInput.value = "";
+        }
+    });
+
+    uploadForm.addEventListener("submit", handleUploadSubmit);
+}
+
+function addFilesToQueue(newFiles) {
+    const allowedExts = [".pdf", ".docx", ".doc", ".md", ".txt"];
+    const maxSizeBytes = 25 * 1024 * 1024;
+
+    newFiles.forEach(f => {
+        const ext = "." + f.name.split(".").pop().toLowerCase();
+        if (!allowedExts.includes(ext)) {
+            alert(`El archivo "${f.name}" tiene una extensión no admitida (${ext}). Formatos soportados: PDF, DOCX, DOC, MD, TXT.`);
+            return;
+        }
+        if (f.size > maxSizeBytes) {
+            alert(`El archivo "${f.name}" supera el límite de 25 MB (${(f.size / (1024 * 1024)).toFixed(1)} MB).`);
+            return;
+        }
+        // Avoid duplicate by name and size
+        if (!uploadQueue.some(item => item.name === f.name && item.size === f.size)) {
+            uploadQueue.push(f);
+        }
+    });
+
+    renderFileQueue();
+}
+
+function renderFileQueue() {
+    const queueContainer = document.getElementById("file-queue");
+    const submitBtn = document.getElementById("upload-submit-btn");
+
+    if (!queueContainer) return;
+
+    if (uploadQueue.length === 0) {
+        queueContainer.style.display = "none";
+        queueContainer.innerHTML = "";
+        if (submitBtn) submitBtn.disabled = true;
+        return;
+    }
+
+    queueContainer.style.display = "flex";
+    queueContainer.innerHTML = "";
+
+    uploadQueue.forEach((file, idx) => {
+        const ext = file.name.split(".").pop().toLowerCase();
+        const sizeKb = (file.size / 1024).toFixed(1);
+        const itemDiv = document.createElement("div");
+        itemDiv.className = "file-queue-item";
+        itemDiv.innerHTML = `
+            <div class="file-queue-left">
+                <span class="badge badge-gold">${escapeHtml(ext.toUpperCase())}</span>
+                <span><strong>${escapeHtml(file.name)}</strong> <small style="color: #94a3b8;">(${sizeKb} KB)</small></span>
+            </div>
+            <button type="button" class="file-remove-btn" onclick="removeFileFromQueue(${idx})" title="Quitar archivo">✖</button>
+        `;
+        queueContainer.appendChild(itemDiv);
+    });
+
+    if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = `📤 Subir e Indexar ${uploadQueue.length} ${uploadQueue.length === 1 ? 'Archivo' : 'Archivos'} en RAG`;
+    }
+}
+
+function removeFileFromQueue(idx) {
+    uploadQueue.splice(idx, 1);
+    renderFileQueue();
+}
+
+async function handleUploadSubmit(e) {
+    e.preventDefault();
+    if (uploadQueue.length === 0) return;
+
+    const submitBtn = document.getElementById("upload-submit-btn");
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = '<span class="spinner"></span> Procesando e indexando documentos...';
+
+    const formData = new FormData();
+    uploadQueue.forEach(f => formData.append("files", f));
+    formData.append("department_id", document.getElementById("upload-dept").value);
+    formData.append("author", document.getElementById("upload-author").value.trim() || "Staff Técnico");
+    formData.append("tags", document.getElementById("upload-tags").value.trim());
+
+    const resultsContainer = document.getElementById("upload-results");
+    resultsContainer.style.display = "none";
+    resultsContainer.innerHTML = "";
+
+    try {
+        const res = await fetch(`${API_BASE}/api/upload`, {
+            method: "POST",
+            body: formData
+        });
+
+        const data = await res.json();
+        renderUploadResults(data);
+
+        // Clear queue on completion
+        uploadQueue = [];
+        renderFileQueue();
+        loadStats();
+        loadDocuments();
+    } catch (err) {
+        alert("Error durante la carga: " + err.message);
+    } finally {
+        submitBtn.disabled = uploadQueue.length === 0;
+        submitBtn.innerHTML = "📤 Subir e Indexar Archivos en RAG";
+    }
+}
+
+function renderUploadResults(data) {
+    const container = document.getElementById("upload-results");
+    if (!container) return;
+
+    container.style.display = "grid";
+    container.innerHTML = "";
+
+    if (!data.details || data.details.length === 0) {
+        container.innerHTML = "<p>No se recibieron detalles de procesamiento.</p>";
+        return;
+    }
+
+    data.details.forEach(item => {
+        const card = document.createElement("div");
+        card.className = `upload-result-card ${item.status === 'success' ? 'success' : 'error'}`;
+
+        if (item.status === "success") {
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">
+                    <strong>📄 ${escapeHtml(item.filename)}</strong>
+                    <span class="badge badge-success">✓ Indexado</span>
+                </div>
+                <div style="font-size: 0.8rem; color: #cbd5e1; margin-bottom: 0.5rem;">
+                    Código RAG: <code>${escapeHtml(item.doc_code)}</code><br>
+                    Fragmentos generados: <strong>${item.chunks_created}</strong><br>
+                    ${item.size_bytes ? `Tamaño: ${(item.size_bytes / 1024).toFixed(1)} KB` : ''}
+                </div>
+                <button class="player-rag-btn" style="margin-top: 0.4rem; padding: 0.4rem 0.6rem; font-size: 0.78rem;" onclick="queryUploadedDoc('${escapeHtml(item.doc_code)}')">
+                    🔍 Consultar este documento
+                </button>
+            `;
+        } else {
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">
+                    <strong>⚠️ ${escapeHtml(item.filename)}</strong>
+                    <span class="badge badge-danger" style="background:#ef4444; color:#fff;">Error</span>
+                </div>
+                <div style="font-size: 0.8rem; color: #f87171;">
+                    ${escapeHtml(item.message)}
+                </div>
+            `;
+        }
+        container.appendChild(card);
+    });
+}
+
+function queryUploadedDoc(docCode) {
+    document.querySelector('.nav-btn[data-tab="tab-query"]').click();
+    document.getElementById("query-input").value = `¿Qué información clave contiene el documento con código ${docCode}?`;
+    executeQuery();
 }
 
 async function loadStats() {
@@ -123,7 +325,7 @@ function renderResult(data) {
     telemetryEl.innerHTML = `
         <span class="badge badge-info">⏱️ Total: ${data.timings.total_ms} ms</span>
         <span class="badge badge-success">🔍 Búsqueda: ${data.timings.retrieval_ms} ms</span>
-        <span class="badge badge-gold">🧠 Motor: ${data.model_used} (${data.timings.generation_ms} ms)</span>
+        <span class="badge badge-gold">🧠 Motor: ${escapeHtml(data.model_used)} (${data.timings.generation_ms} ms)</span>
         <span class="badge badge-info">🎯 Confianza: ${Math.round(data.confidence * 100)}%</span>
     `;
 
@@ -134,16 +336,18 @@ function renderResult(data) {
         const chunkDiv = document.createElement("div");
         chunkDiv.className = "chunk-card";
 
-        const modalities = ch.modalities
+        const modalities = (ch.modalities || [])
             .map(m => `<span class="badge badge-gold">${m === "lexical" ? "BM25 FTS5" : "Vector Denso"}</span>`)
             .join(" ");
+
+        const snippetHtml = formatSnippet(ch.match_snippet);
 
         chunkDiv.innerHTML = `
             <div class="chunk-header" onclick="toggleChunk(${idx})">
                 <div>
                     <strong>[#${idx + 1}] ${escapeHtml(ch.title)}</strong>
                     <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 2px;">
-                        Área: <code>${ch.department_id}</code> | Ref: <code>${ch.metadata.doc_code || 'DOC'}</code>
+                        Área: <code>${escapeHtml(ch.department_id)}</code> | Ref: <code>${escapeHtml((ch.metadata && ch.metadata.doc_code) || 'DOC')}</code>
                     </div>
                 </div>
                 <div class="chunk-scores">
@@ -153,8 +357,8 @@ function renderResult(data) {
                 </div>
             </div>
             <div class="chunk-body" id="chunk-body-${idx}" style="display: ${idx === 0 ? 'block' : 'none'};">
-                ${ch.match_snippet ? `<p style="margin-bottom: 8px; color: #f59e0b;"><strong>Coincidencia Léxica:</strong> ${ch.match_snippet}</p>` : ''}
-                ${escapeHtml(ch.content)}
+                ${snippetHtml ? `<p style="margin-bottom: 8px; color: #f59e0b;"><strong>Coincidencia Léxica:</strong> ${snippetHtml}</p>` : ''}
+                <div style="white-space: pre-wrap; font-family: inherit;">${escapeHtml(ch.content)}</div>
             </div>
         `;
         chunksEl.appendChild(chunkDiv);
@@ -169,6 +373,12 @@ function toggleChunk(idx) {
     if (el) {
         el.style.display = el.style.display === "none" ? "block" : "none";
     }
+}
+
+function formatSnippet(snippet) {
+    if (!snippet) return "";
+    const escaped = escapeHtml(snippet);
+    return escaped.replace(/«([^»]+)»/g, '<mark class="fts-match">$1</mark>');
 }
 
 function formatMarkdown(mdText) {
@@ -187,10 +397,8 @@ function formatMarkdown(mdText) {
         .replace(/`([^`]+)`/gim, '<code>$1</code>')
         .replace(/\[REF:\s*([^\]]+)\]/gim, '<span class="badge badge-gold" style="font-size:0.7rem;">REF: $1</span>');
 
-    // Group consecutive <li> elements into a single <ul>
     html = html.replace(/(?:<li>.*?<\/li>\s*)+/gm, (match) => `<ul>${match}</ul>`);
 
-    // Render Markdown tables
     html = html.replace(/(\|.+\|\n?)+/gm, (match) => {
         const rows = match.trim().split("\n");
         let tableHtml = "<table>";
@@ -212,8 +420,13 @@ function formatMarkdown(mdText) {
 }
 
 function escapeHtml(str) {
-    if (!str) return "";
-    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    if (str === null || str === undefined) return "";
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
 }
 
 async function loadPlayers() {
@@ -226,10 +439,11 @@ async function loadPlayers() {
         players.forEach(p => {
             const card = document.createElement("div");
             card.className = "player-card";
+            const safeName = escapeHtml(p.name);
             card.innerHTML = `
                 <div class="player-dorsal">#${p.dorsal}</div>
-                <div class="player-name">${p.name} ${p.nickname ? `"${p.nickname}"` : ''}</div>
-                <div class="player-pos">${p.position}</div>
+                <div class="player-name">${safeName} ${p.nickname ? `"${escapeHtml(p.nickname)}"` : ''}</div>
+                <div class="player-pos">${escapeHtml(p.position)}</div>
                 <div class="player-meta">
                     <span>${p.age} años</span>
                     <span>•</span>
@@ -237,8 +451,8 @@ async function loadPlayers() {
                     <span>•</span>
                     <span>${p.weight_kg} kg</span>
                 </div>
-                <div class="player-notes">${p.notes || 'Sin observaciones'}</div>
-                <button class="player-rag-btn" onclick="queryPlayer('${p.name}')">
+                <div class="player-notes">${escapeHtml(p.notes || 'Sin observaciones')}</div>
+                <button class="player-rag-btn" onclick="queryPlayer('${safeName}')">
                     🔍 Consultar Ficha Médica / GPS
                 </button>
             `;
@@ -264,18 +478,48 @@ async function loadDocuments() {
         tableBody.innerHTML = "";
         docs.forEach(d => {
             const row = document.createElement("tr");
+            const fmt = (d.source_type || 'md').toUpperCase();
+            const safeTitle = escapeHtml(d.title);
             row.innerHTML = `
-                <td><code>${d.doc_code}</code></td>
-                <td><strong>${escapeHtml(d.title)}</strong></td>
-                <td><span class="badge badge-info">${d.department_name}</span></td>
-                <td>${d.author}</td>
-                <td>${d.date}</td>
-                <td><span class="badge badge-gold">${d.chunk_count} chunks</span></td>
+                <td><code>${escapeHtml(d.doc_code)}</code></td>
+                <td><strong>${safeTitle}</strong></td>
+                <td><span class="badge badge-info">${escapeHtml(d.department_name)}</span></td>
+                <td>${escapeHtml(d.author)}</td>
+                <td><span class="badge badge-gold" style="font-size:0.75rem;">${escapeHtml(fmt)}</span></td>
+                <td>${escapeHtml(d.date || d.created_at || '')}</td>
+                <td><span class="badge badge-info">${d.chunk_count} chunks</span></td>
+                <td>
+                    <button class="btn-delete" onclick="confirmDeleteDocument(${d.id}, '${safeTitle}')" title="Eliminar documento e índices RAG">
+                        🗑️ Eliminar
+                    </button>
+                </td>
             `;
             tableBody.appendChild(row);
         });
     } catch (e) {
         console.error("Error loading documents:", e);
+    }
+}
+
+async function confirmDeleteDocument(docId, docTitle) {
+    if (!confirm(`¿Estás seguro de que deseas eliminar permanentemente el documento "${docTitle}" y todos sus fragmentos indexados de la base de datos RAG?`)) {
+        return;
+    }
+
+    try {
+        const res = await fetch(`${API_BASE}/api/documents/${docId}`, {
+            method: "DELETE"
+        });
+        const data = await res.json();
+        if (res.ok) {
+            alert(data.message || "Documento eliminado correctamente.");
+            loadStats();
+            loadDocuments();
+        } else {
+            alert("Error al eliminar: " + (data.detail || "Error desconocido."));
+        }
+    } catch (err) {
+        alert("Error de conexión al eliminar: " + err.message);
     }
 }
 
@@ -290,14 +534,14 @@ async function loadStaff() {
             const card = document.createElement("div");
             card.className = "player-card";
             card.innerHTML = `
-                <div class="player-name">${s.name}</div>
-                <div class="player-pos">${s.role}</div>
+                <div class="player-name">${escapeHtml(s.name)}</div>
+                <div class="player-pos">${escapeHtml(s.role)}</div>
                 <div style="font-size: 0.8rem; color: #94a3b8; margin-bottom: 0.5rem;">
-                    Área: <strong>${s.department_name}</strong>
+                    Área: <strong>${escapeHtml(s.department_name)}</strong>
                 </div>
                 <div style="font-size: 0.78rem; color: #cbd5e1;">
-                    📧 ${s.email}<br>
-                    📞 ${s.phone}
+                    📧 ${escapeHtml(s.email)}<br>
+                    📞 ${escapeHtml(s.phone)}
                 </div>
             `;
             container.appendChild(card);
@@ -317,9 +561,9 @@ async function loadLogs() {
         logs.forEach(l => {
             const row = document.createElement("tr");
             row.innerHTML = `
-                <td>${l.created_at}</td>
+                <td>${escapeHtml(l.created_at)}</td>
                 <td><strong>${escapeHtml(l.query_text)}</strong></td>
-                <td><span class="badge badge-info">${l.department_filter || 'Todos'}</span></td>
+                <td><span class="badge badge-info">${escapeHtml(l.department_filter || 'Todos')}</span></td>
                 <td>${l.retrieved_chunks_count}</td>
                 <td><span class="badge badge-success">${l.total_ms} ms</span></td>
                 <td><code>${(l.top_similarity || 0).toFixed(3)}</code></td>
@@ -354,10 +598,14 @@ async function handleIngestSubmit(e) {
             body: JSON.stringify(payload)
         });
         const data = await res.json();
-        alert(`Éxito: ${data.message} (${data.chunks_created} fragmentos generados)`);
-        document.getElementById("ingest-form").reset();
-        loadStats();
-        loadDocuments();
+        if (res.ok) {
+            alert(`Éxito: ${data.message} (${data.chunks_created} fragmentos generados)`);
+            document.getElementById("ingest-form").reset();
+            loadStats();
+            loadDocuments();
+        } else {
+            alert("Error al indexar: " + (data.detail || "Error desconocido"));
+        }
     } catch (err) {
         alert("Error al indexar: " + err.message);
     } finally {

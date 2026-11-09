@@ -6,13 +6,16 @@ Ingestion pipeline module for Club Atlético Puerto Marina (v2.0).
 """
 import re
 import json
+import hashlib
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import yaml
 
-from src.config import RAW_DOCS_DIR, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, DB_PATH
+from src.config import RAW_DOCS_DIR, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, DB_PATH, UPLOADS_DIR
 from src.database import get_db_connection, init_database
 from src.embeddings import get_embedding_engine
+from src.extractors import extract_document_content, ExtractionError
+from src.retriever import GLOBAL_VECTOR_CACHE
 
 INITIAL_DEPARTMENTS = [
     {
@@ -172,17 +175,72 @@ def parse_markdown_file(file_path: Path) -> Dict[str, Any]:
     }
 
 
+def _split_oversized_text(text: str, max_chars: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> List[str]:
+    """
+    Splits text that exceeds max_chars: first tries sentences, then falls back to sliding window.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    sentence_endings = re.compile(r'(?<=[.!?])\s+')
+    sentences = sentence_endings.split(text)
+
+    chunks = []
+    current_chunk = []
+    current_len = 0
+
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean:
+            continue
+        s_len = len(s_clean)
+
+        if s_len > max_chars:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+            # Hard window split for long single sentence / table row
+            start = 0
+            while start < s_len:
+                end = min(start + max_chars, s_len)
+                chunks.append(s_clean[start:end])
+                start += max_chars - overlap
+            continue
+
+        if current_len + s_len + 1 > max_chars and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            if len(current_chunk[-1]) <= overlap:
+                current_chunk = [current_chunk[-1], s_clean]
+                current_len = len(current_chunk[0]) + s_len + 1
+            else:
+                current_chunk = [s_clean]
+                current_len = s_len
+        else:
+            current_chunk.append(s_clean)
+            current_len += s_len + 1
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+
 def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Chunks markdown content by headers (##, ###) or sliding window,
-    enriching each chunk with an explicit contextual prefix.
+    Chunks document content with:
+    - Section header preservation & hierarchical title enrichment.
+    - Sentence-aware and sliding-window splitting for oversized text.
+    - Markdown table header retention across split chunks.
+    - Automatic rejection of empty or junk chunks (e.g. standalone dividers or empty headings).
+    - Explicit contextual prefix injection for dense vector and lexical alignment.
     """
     content = doc_meta["raw_content"]
     title = doc_meta["title"]
     dept = doc_meta["department_id"]
-    author = doc_meta["author"]
-    date_str = doc_meta["date"]
-    tags = doc_meta["tags"]
+    author = doc_meta.get("author") or "Club Atlético Puerto Marina"
+    date_str = str(doc_meta.get("date") or "2026-11-01")
+    tags = doc_meta.get("tags") or ""
 
     section_pattern = re.compile(r'(?=^#{2,3}\s+)', re.MULTILINE)
     raw_sections = [s.strip() for s in section_pattern.split(content) if s.strip()]
@@ -194,6 +252,16 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     chunk_idx = 0
 
     for sec in raw_sections:
+        # Determine section title if a heading exists
+        header_match = re.search(r'^(#{2,3})\s+(.+)$', sec, re.MULTILINE)
+        section_title = header_match.group(2).strip() if header_match else f"Sección {chunk_idx + 1}"
+        chunk_title = f"{title} - {section_title}" if section_title != title else f"{title} (Parte {chunk_idx + 1})"
+
+        # Check for junk / trivial section (< 25 alphanumeric chars)
+        alnum_count = sum(1 for ch in sec if ch.isalnum())
+        if alnum_count < 25:
+            continue
+
         if len(sec) <= CHUNK_SIZE_CHARS:
             augmented_content = (
                 f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
@@ -202,14 +270,15 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
             final_chunks.append({
                 "chunk_index": chunk_idx,
-                "title": f"{title} (Sección {chunk_idx + 1})",
+                "title": chunk_title,
                 "department_id": dept,
                 "content": augmented_content,
                 "metadata": {
-                    "doc_code": doc_meta["doc_code"],
+                    "doc_code": doc_meta.get("doc_code", f"DOC-{chunk_idx+1}"),
                     "date": date_str,
                     "author": author,
-                    "tags": tags
+                    "tags": tags,
+                    "source_type": doc_meta.get("source_type", "markdown")
                 }
             })
             chunk_idx += 1
@@ -217,11 +286,63 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
             paragraphs = sec.split("\n\n")
             current_buffer = []
             current_len = 0
+            last_table_header = None
 
             for p in paragraphs:
-                p_len = len(p)
-                if current_len + p_len > CHUNK_SIZE_CHARS and current_buffer:
-                    chunk_text = "\n\n".join(current_buffer)
+                p_clean = p.strip()
+                if not p_clean:
+                    continue
+
+                # Detect and track table headers to preserve them if table is split
+                if p_clean.startswith("|") and "\n|" in p_clean and "---" in p_clean:
+                    lines = p_clean.split("\n")
+                    if len(lines) >= 2 and "---" in lines[1]:
+                        last_table_header = lines[0] + "\n" + lines[1]
+
+                # If paragraph itself is oversized, split it using sentence/window splitter
+                sub_parts = _split_oversized_text(p_clean, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS)
+
+                for part in sub_parts:
+                    part_len = len(part)
+                    if current_len + part_len > CHUNK_SIZE_CHARS and current_buffer:
+                        chunk_text = "\n\n".join(current_buffer)
+                        augmented_content = (
+                            f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
+                            f"TAGS: {tags}\n\n"
+                            f"{chunk_text}"
+                        )
+                        final_chunks.append({
+                            "chunk_index": chunk_idx,
+                            "title": f"{chunk_title} (Parte {chunk_idx + 1})",
+                            "department_id": dept,
+                            "content": augmented_content,
+                            "metadata": {
+                                "doc_code": doc_meta.get("doc_code", f"DOC-{chunk_idx+1}"),
+                                "date": date_str,
+                                "author": author,
+                                "tags": tags,
+                                "source_type": doc_meta.get("source_type", "markdown")
+                            }
+                        })
+                        chunk_idx += 1
+
+                        # Carry forward table header if next part is table rows without header
+                        if last_table_header and part.startswith("|") and "---" not in part:
+                            current_buffer = [last_table_header, part]
+                            current_len = len(last_table_header) + part_len + 2
+                        elif len(current_buffer[-1]) < CHUNK_OVERLAP_CHARS:
+                            current_buffer = [current_buffer[-1], part]
+                            current_len = len(current_buffer[0]) + part_len + 2
+                        else:
+                            current_buffer = [part]
+                            current_len = part_len
+                    else:
+                        current_buffer.append(part)
+                        current_len += part_len + 2
+
+            if current_buffer:
+                chunk_text = "\n\n".join(current_buffer)
+                if sum(1 for ch in chunk_text if ch.isalnum()) >= 25:
                     augmented_content = (
                         f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
                         f"TAGS: {tags}\n\n"
@@ -229,47 +350,18 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
                     )
                     final_chunks.append({
                         "chunk_index": chunk_idx,
-                        "title": f"{title} (Parte {chunk_idx + 1})",
+                        "title": f"{chunk_title} (Parte {chunk_idx + 1})",
                         "department_id": dept,
                         "content": augmented_content,
                         "metadata": {
-                            "doc_code": doc_meta["doc_code"],
+                            "doc_code": doc_meta.get("doc_code", f"DOC-{chunk_idx+1}"),
                             "date": date_str,
                             "author": author,
-                            "tags": tags
+                            "tags": tags,
+                            "source_type": doc_meta.get("source_type", "markdown")
                         }
                     })
                     chunk_idx += 1
-                    if len(current_buffer[-1]) < CHUNK_OVERLAP_CHARS:
-                        current_buffer = [current_buffer[-1], p]
-                        current_len = len(current_buffer[0]) + p_len
-                    else:
-                        current_buffer = [p]
-                        current_len = p_len
-                else:
-                    current_buffer.append(p)
-                    current_len += p_len + 2
-
-            if current_buffer:
-                chunk_text = "\n\n".join(current_buffer)
-                augmented_content = (
-                    f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
-                    f"TAGS: {tags}\n\n"
-                    f"{chunk_text}"
-                )
-                final_chunks.append({
-                    "chunk_index": chunk_idx,
-                    "title": f"{title} (Parte {chunk_idx + 1})",
-                    "department_id": dept,
-                    "content": augmented_content,
-                    "metadata": {
-                        "doc_code": doc_meta["doc_code"],
-                        "date": date_str,
-                        "author": author,
-                        "tags": tags
-                    }
-                })
-                chunk_idx += 1
 
     return final_chunks
 
@@ -282,9 +374,18 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
     if not cur.fetchone():
         doc_meta["department_id"] = "cuerpo_tecnico"
 
+    source_type = doc_meta.get("source_type", "markdown")
+    original_filename = doc_meta.get("original_filename") or (Path(doc_meta["file_path"]).name if doc_meta.get("file_path") else "")
+    content_hash = doc_meta.get("content_hash") or hashlib.sha256(doc_meta["raw_content"].encode("utf-8")).hexdigest()
+    file_size_bytes = int(doc_meta.get("file_size_bytes") or len(doc_meta["raw_content"].encode("utf-8")))
+
     cur.execute("""
-        INSERT INTO documents (doc_code, title, department_id, author, date, file_path, confidentiality, tags, raw_content)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO documents (
+            doc_code, title, department_id, author, date, file_path,
+            confidentiality, tags, raw_content, source_type,
+            original_filename, content_hash, file_size_bytes
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(doc_code) DO UPDATE SET
             title=excluded.title,
             department_id=excluded.department_id,
@@ -293,7 +394,11 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
             file_path=excluded.file_path,
             confidentiality=excluded.confidentiality,
             tags=excluded.tags,
-            raw_content=excluded.raw_content
+            raw_content=excluded.raw_content,
+            source_type=excluded.source_type,
+            original_filename=excluded.original_filename,
+            content_hash=excluded.content_hash,
+            file_size_bytes=excluded.file_size_bytes
         RETURNING id;
     """, (
         doc_meta["doc_code"],
@@ -302,9 +407,13 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
         doc_meta["author"],
         doc_meta["date"],
         doc_meta["file_path"],
-        doc_meta["confidentiality"],
-        doc_meta["tags"],
-        doc_meta["raw_content"]
+        doc_meta.get("confidentiality", "interno"),
+        doc_meta.get("tags", ""),
+        doc_meta["raw_content"],
+        source_type,
+        original_filename,
+        content_hash,
+        file_size_bytes
     ))
     row = cur.fetchone()
     doc_id = row[0] if row else None
@@ -322,6 +431,8 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
 
     chunks = chunk_document(doc_meta)
     if not chunks:
+        GLOBAL_VECTOR_CACHE.invalidate()
+        conn.commit()
         return doc_id, 0
 
     chunk_texts = [c["content"] for c in chunks]
@@ -345,7 +456,67 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
         """, (chunk_id, str(chunk_id), c["title"], c["department_id"], c["content"], doc_meta["tags"]))
 
     conn.commit()
+    GLOBAL_VECTOR_CACHE.invalidate()
     return doc_id, len(chunks)
+
+
+def ingest_uploaded_file(
+    file_path: Path,
+    original_filename: str,
+    department_id: str,
+    author: str,
+    tags: str,
+    conn,
+    embedder,
+    file_bytes: Optional[bytes] = None
+) -> Tuple[int, int, str]:
+    """
+    Ingests an uploaded document (PDF, DOCX, DOC, MD, TXT):
+    1. Extracts structured Markdown using src.extractors.
+    2. Computes SHA-256 hash.
+    3. Handles deduplication.
+    4. Indexes chunks and FTS5.
+    5. Returns (doc_id, chunk_count, doc_code).
+    """
+    if file_bytes is None:
+        file_bytes = file_path.read_bytes()
+
+    content_hash = hashlib.sha256(file_bytes).hexdigest()
+    file_size_bytes = len(file_bytes)
+
+    extraction = extract_document_content(file_bytes, original_filename)
+    raw_markdown = extraction["text"]
+    inferred_title = extraction.get("inferred_title", Path(original_filename).stem.replace("-", " ").title())
+    source_format = extraction.get("format", Path(original_filename).suffix.lstrip("."))
+
+    cur = conn.cursor()
+    cur.execute("SELECT id, doc_code FROM documents WHERE content_hash = ?", (content_hash,))
+    existing = cur.fetchone()
+    if existing:
+        doc_code = existing["doc_code"]
+    else:
+        dept_prefix = department_id[:3].upper() if department_id else "GEN"
+        slug = re.sub(r'[^a-zA-Z0-9]', '', Path(original_filename).stem)[:12].upper()
+        doc_code = f"UPL-{dept_prefix}-{slug}-{content_hash[:6].upper()}"
+
+    doc_meta = {
+        "doc_code": doc_code,
+        "title": inferred_title,
+        "department_id": department_id,
+        "author": author or "Staff Técnico",
+        "date": "2026-11-09",
+        "confidentiality": "interno",
+        "tags": tags,
+        "raw_content": raw_markdown,
+        "file_path": str(file_path),
+        "source_type": source_format,
+        "original_filename": original_filename,
+        "content_hash": content_hash,
+        "file_size_bytes": file_size_bytes
+    }
+
+    doc_id, chunk_count = ingest_doc_metadata_dict(doc_meta, conn, embedder)
+    return doc_id, chunk_count, doc_code
 
 
 def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
@@ -369,13 +540,22 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "| Dorsal | Nombre | Apodo | Posición | Edad | Altura (m) | Peso (kg) | Observaciones Clínicas y Tácticas |",
         "|---|---|---|---|---|---|---|---|"
     ]
-    player_bullets = ["\n## Detalle Individual de Futbolistas del Plantel"]
     for p in players:
         roster_lines.append(
             f"| #{p['dorsal']} | {p['name']} | {p['nickname']} | {p['position']} | {p['age']} años | {p['height_m']} m | {p['weight_kg']} kg | {p['notes']} |"
         )
-        player_bullets.append(
-            f"- **Dorsal #{p['dorsal']} - {p['name']} (\"{p['nickname']}\")**: Juega como {p['position']}, tiene {p['age']} años, mide {p['height_m']} m y pesa {p['weight_kg']} kg. Nota oficial: {p['notes']}"
+
+    player_sections = ["\n## Fichas Individuales de Futbolistas del Plantel"]
+    for p in players:
+        player_sections.append(
+            f"### Futbolista: #{p['dorsal']} {p['name']} (\"{p['nickname']}\")\n"
+            f"- **Dorsal**: #{p['dorsal']}\n"
+            f"- **Nombre Completo**: {p['name']}\n"
+            f"- **Posición**: {p['position']}\n"
+            f"- **Edad**: {p['age']} años\n"
+            f"- **Estatura / Altura**: {p['height_m']} m\n"
+            f"- **Peso Corporal**: {p['weight_kg']} kg\n"
+            f"- **Observaciones Clínicas y Tácticas**: {p['notes']}\n"
         )
 
     roster_doc = {
@@ -386,8 +566,9 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "date": "2026-11-06",
         "confidentiality": "interno",
         "tags": "plantel, jugadores, dorsales, altura, peso, edad, posicion, arquero, delantero, defensor, mediocampista",
-        "raw_content": "\n".join(roster_lines) + "\n\n" + "\n".join(player_bullets),
-        "file_path": "sqlite://players"
+        "raw_content": "\n".join(roster_lines) + "\n\n" + "\n\n".join(player_sections),
+        "file_path": "sqlite://players",
+        "source_type": "relational_sql"
     }
 
     # 2. Build Virtual Staff & Departments Document from SQL `staff` & `departments`
@@ -403,13 +584,21 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "| Profesional | Cargo / Rol | Departamento | Correo Electrónico (Email) | Teléfono Directo |",
         "|---|---|---|---|---|"
     ]
-    staff_bullets = ["\n## Contacto Directo y Responsabilidades del Staff"]
     for s in staff_rows:
         staff_lines.append(
             f"| {s['name']} | {s['role']} | {s['dept_name']} | {s['email']} | {s['phone']} |"
         )
-        staff_bullets.append(
-            f"- **{s['name']}** ({s['role']} en {s['dept_name']}): Email `{s['email']}` | Teléfono `{s['phone']}`. Área encargada de: {s['dept_desc']}"
+
+    staff_sections = ["\n## Contacto Directo y Responsabilidades Individuales del Staff"]
+    for s in staff_rows:
+        staff_sections.append(
+            f"### Integrante del Staff: {s['name']} ({s['role']})\n"
+            f"- **Nombre Completo**: {s['name']}\n"
+            f"- **Cargo / Función**: {s['role']}\n"
+            f"- **Departamento**: {s['dept_name']}\n"
+            f"- **Correo Electrónico Oficial (Email)**: {s['email']}\n"
+            f"- **Teléfono Directo de Contacto**: {s['phone']}\n"
+            f"- **Misión y Competencia del Área**: {s['dept_desc']}\n"
         )
 
     staff_doc = {
@@ -420,8 +609,9 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "date": "2026-11-06",
         "confidentiality": "interno",
         "tags": "staff, directorio, telefono, email, correo, contacto, medico, nutricionista, kinesiologa, entrenador, preparador_fisico",
-        "raw_content": "\n".join(staff_lines) + "\n\n" + "\n".join(staff_bullets),
-        "file_path": "sqlite://staff"
+        "raw_content": "\n".join(staff_lines) + "\n\n" + "\n\n".join(staff_sections),
+        "file_path": "sqlite://staff",
+        "source_type": "relational_sql"
     }
 
     _, c1 = ingest_doc_metadata_dict(roster_doc, conn, embedder)
@@ -429,11 +619,11 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
     return 2, (c1 + c2)
 
 
-def run_full_ingestion() -> Dict[str, Any]:
+def run_full_ingestion(db_path: Path = DB_PATH) -> Dict[str, Any]:
     """Runs end-to-end ingestion over all markdown files AND relational SQL tables."""
-    print("1. Inicializando esquema SQLite + FTS5...")
-    init_database(DB_PATH)
-    conn = get_db_connection(DB_PATH)
+    print(f"1. Inicializando esquema SQLite + FTS5 en {db_path}...")
+    init_database(db_path)
+    conn = get_db_connection(db_path)
     seed_metadata(conn)
 
     print("2. Cargando motor de embeddings multilingüe (FastEmbed ONNX)...")
@@ -457,11 +647,12 @@ def run_full_ingestion() -> Dict[str, Any]:
     print(f"   -> [SQL] {sql_docs} documentos virtuales generados ({sql_chunks} chunks)")
 
     conn.close()
+    GLOBAL_VECTOR_CACHE.invalidate(str(db_path))
     print(f"Ingesta completada con éxito: {total_docs} documentos y {total_chunks} fragmentos activos.")
     return {
         "documents_count": total_docs,
         "chunks_count": total_chunks,
-        "db_path": str(DB_PATH)
+        "db_path": str(db_path)
     }
 
 

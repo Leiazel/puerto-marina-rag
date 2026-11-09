@@ -61,7 +61,7 @@ def init_database(db_path: Path = DB_PATH) -> None:
     );
     """)
 
-    # 4. Documents table
+    # 4. Documents table (enhanced in v3.0 with source_type, original_filename, content_hash, file_size_bytes)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS documents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,9 +74,24 @@ def init_database(db_path: Path = DB_PATH) -> None:
         confidentiality TEXT DEFAULT 'interno',
         tags TEXT,
         raw_content TEXT NOT NULL,
+        source_type TEXT DEFAULT 'markdown',
+        original_filename TEXT,
+        content_hash TEXT,
+        file_size_bytes INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # Schema migration: Add columns to existing documents table if not present
+    existing_cols = {row["name"] for row in cur.execute("PRAGMA table_info(documents);").fetchall()}
+    if "source_type" not in existing_cols:
+        cur.execute("ALTER TABLE documents ADD COLUMN source_type TEXT DEFAULT 'markdown';")
+    if "original_filename" not in existing_cols:
+        cur.execute("ALTER TABLE documents ADD COLUMN original_filename TEXT;")
+    if "content_hash" not in existing_cols:
+        cur.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT;")
+    if "file_size_bytes" not in existing_cols:
+        cur.execute("ALTER TABLE documents ADD COLUMN file_size_bytes INTEGER DEFAULT 0;")
 
     # 5. Chunks table (Stores text + float32 vector embedding as BLOB)
     cur.execute("""
@@ -127,6 +142,33 @@ def init_database(db_path: Path = DB_PATH) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_dept ON documents(department_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_date ON documents(date);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_code ON documents(doc_code);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_hash ON documents(content_hash);")
 
     conn.commit()
     conn.close()
+
+
+def delete_document(doc_id: int, conn: sqlite3.Connection) -> bool:
+    """
+    Cascades deletion of a document:
+    1. Removes associated FTS5 rows.
+    2. Removes chunk records.
+    3. Deletes document record.
+    Returns True if a document was deleted, False otherwise.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM documents WHERE id = ?", (doc_id,))
+    if not cur.fetchone():
+        return False
+
+    # Get chunk IDs to delete from FTS5
+    cur.execute("SELECT id FROM chunks WHERE document_id = ?", (doc_id,))
+    chunk_ids = [r["id"] for r in cur.fetchall()]
+
+    for cid in chunk_ids:
+        cur.execute("DELETE FROM chunks_fts WHERE rowid = ?", (cid,))
+
+    cur.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
+    cur.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    conn.commit()
+    return True

@@ -93,6 +93,22 @@ class ClubRAGPipeline:
         except Exception as e:
             print(f"Warning: could not write to query_logs ({e})")
 
+    def invalidate_cache(self) -> None:
+        """Invalidates the in-memory dense vector cache."""
+        self.retriever.invalidate_cache()
+
+    def delete_document(self, doc_id: int) -> bool:
+        """Cascades deletion of a document and invalidates vector cache."""
+        from src.database import delete_document
+        conn = get_db_connection(self.db_path)
+        try:
+            ok = delete_document(doc_id, conn)
+            if ok:
+                self.invalidate_cache()
+            return ok
+        finally:
+            conn.close()
+
     def get_stats(self) -> Dict[str, Any]:
         conn = get_db_connection(self.db_path)
         cur = conn.cursor()

@@ -282,10 +282,11 @@ class GroundedGenerator:
                     continue
 
                 # Non-table lines
-                if clean_l.startswith("###") or clean_l.startswith("##"):
-                    if chunk_rank == 0 and len(paragraphs) < 2 and clean_l not in seen_lines:
-                        seen_lines.add(clean_l)
-                        paragraphs.append(f"**{clean_l.replace('#', '').strip()}**")
+                if clean_l.startswith("#"):
+                    clean_header = clean_l.lstrip("#").strip()
+                    if chunk_rank == 0 and len(paragraphs) < 2 and clean_header and clean_header not in seen_lines:
+                        seen_lines.add(clean_header)
+                        paragraphs.append(f"**{clean_header}**")
                 elif clean_l.startswith("- ") or clean_l.startswith("* "):
                     if term_hits > 0 or chunk_rank == 0:
                         if clean_l not in seen_lines:

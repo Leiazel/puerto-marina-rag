@@ -96,12 +96,55 @@ def main():
     parser.add_argument("--interactive", "-i", action="store_true", help="Iniciar sesión interactiva")
     parser.add_argument("--stats", "-s", action="store_true", help="Mostrar estadísticas de la base de datos")
     parser.add_argument("--reindex", "-r", action="store_true", help="Reindexar todos los documentos de la carpeta data")
+    parser.add_argument("--upload", "-u", nargs="+", help="Cargar e indexar uno o múltiples archivos (PDF, DOCX, DOC, MD, TXT)")
+    parser.add_argument("--author", type=str, default="Staff Técnico", help="Autor de los archivos a subir (default: Staff Técnico)")
+    parser.add_argument("--tags", type=str, default="", help="Etiquetas separadas por comas para los archivos a subir")
 
     args = parser.parse_args()
 
     if args.reindex:
         print_banner()
         run_full_ingestion()
+        return
+
+    if args.upload:
+        print_banner()
+        from src.config import DB_PATH, UPLOADS_DIR
+        from src.database import get_db_connection
+        from src.embeddings import get_embedding_engine
+        from src.ingestion import ingest_uploaded_file
+
+        dept_id = args.dept or "cuerpo_tecnico"
+        print(f"📤 Iniciando subida de {len(args.upload)} archivo(s) al departamento '{dept_id}'...")
+        conn = get_db_connection(DB_PATH)
+        embedder = get_embedding_engine()
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        dest_dir = UPLOADS_DIR / dept_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        for file_str in args.upload:
+            file_path = Path(file_str)
+            if not file_path.exists():
+                print(f"❌ Archivo no encontrado: {file_str}")
+                continue
+            try:
+                dest_file = dest_dir / file_path.name
+                dest_file.write_bytes(file_path.read_bytes())
+                doc_id, count, doc_code = ingest_uploaded_file(
+                    file_path=dest_file,
+                    original_filename=file_path.name,
+                    department_id=dept_id,
+                    author=args.author,
+                    tags=args.tags,
+                    conn=conn,
+                    embedder=embedder
+                )
+                print(f"✅ [{file_path.name}] -> Código {doc_code} (Doc ID {doc_id}: {count} chunks indexados)")
+            except Exception as e:
+                print(f"❌ Error al procesar {file_path.name}: {e}")
+
+        conn.close()
+        print("\n✨ Proceso de carga y sincronización completado.")
         return
 
     pipeline = ClubRAGPipeline()

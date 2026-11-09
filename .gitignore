@@ -48,3 +48,7 @@ Thumbs.db
 # IDE files
 .vscode/
 .idea/
+
+# Uploaded documents directory
+data/uploads/
+*.pdf

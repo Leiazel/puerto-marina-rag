@@ -1,35 +1,79 @@
 """
-Configuration module for Club Atlético Puerto Marina RAG System (v2.1).
+Configuration module for Club Atlético Puerto Marina RAG System (v2.2).
 Includes hybrid RRF constants, Spanish stopwords for FTS5, and resilient LLM environment settings.
 """
 from pathlib import Path
 import os
+from typing import Set
 
 # Base paths
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 
+_MANAGED_ENV_KEYS = {
+    "USE_EXTERNAL_LLM",
+    "LLM_API_BASE",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "GROQ_API_KEY",
+    "GEMINI_API_KEY",
+    "LLM_MODEL",
+    "OPENAI_MODEL",
+    "GROQ_MODEL",
+    "MODEL_NAME",
+    "LLM_TIMEOUT_SEC",
+    "EMBEDDING_MODEL_NAME",
+    "EMBEDDING_DIM",
+    "CORS_ALLOW_ORIGINS",
+}
+_INITIAL_ENV_SNAPSHOT = dict(os.environ)
 
-def _load_env_file(env_path: Path) -> None:
-    """Loads .env using python-dotenv if available, with a native parser fallback."""
+
+def _parse_env_file(env_path: Path) -> dict[str, str]:
+    """Parses key=value pairs from a .env file."""
+    parsed: dict[str, str] = {}
     if not env_path.exists():
-        return
+        return parsed
     try:
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=env_path, override=False)
+        from dotenv import dotenv_values
+        raw = dotenv_values(env_path)
+        for k, v in raw.items():
+            if k and v is not None:
+                parsed[k] = str(v)
+        return parsed
     except ImportError:
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, val = line.split("=", 1)
             key = key.strip()
-            val = val.strip().strip("'").strip('"')
-            if key and key not in os.environ:
-                os.environ[key] = val
+            val = val.strip()
+            if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                val = val[1:-1]
+            if key:
+                parsed[key] = val
+        return parsed
 
 
-_load_env_file(ENV_FILE)
+def _load_env_file(env_path: Path, override: bool = False) -> None:
+    """Loads .env into os.environ, restoring initial snapshot when override=True so removed keys clear cleanly."""
+    if override:
+        for key in _MANAGED_ENV_KEYS:
+            if key in _INITIAL_ENV_SNAPSHOT:
+                os.environ[key] = _INITIAL_ENV_SNAPSHOT[key]
+            else:
+                os.environ.pop(key, None)
+
+    parsed = _parse_env_file(env_path)
+    for key, val in parsed.items():
+        if override or key not in os.environ:
+            os.environ[key] = val
+
+
+_load_env_file(ENV_FILE, override=False)
 
 DATA_DIR = BASE_DIR / "data"
 RAW_DOCS_DIR = DATA_DIR / "raw_documents"
@@ -37,25 +81,33 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 DATABASE_DIR = DATA_DIR / "database"
 DB_PATH = DATABASE_DIR / "club_knowledge.db"
 
-# Upload and Security settings
+# Upload and security settings
 MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB per file
-ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".md", ".txt"}
+ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".doc", ".md", ".txt"}
 
 # Embedding Model (FastEmbed Multilingual ONNX - 384 dimensions)
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL_NAME",
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
+try:
+    EMBEDDING_DIM = max(1, int(os.getenv("EMBEDDING_DIM", "384")))
+except ValueError:
+    EMBEDDING_DIM = 384
 
 # Chunking settings
-CHUNK_SIZE_CHARS = 1200
-CHUNK_OVERLAP_CHARS = 200
+CHUNK_SIZE_CHARS = 900
+CHUNK_OVERLAP_CHARS = 180
 
 # Hybrid Search Settings
 DEFAULT_TOP_K = 4
 DEFAULT_HYBRID_ALPHA = 0.5  # 0.5 = 50% BM25 lexical, 50% dense vector
 RRF_K_CONSTANT = 60
+
+# CORS origins (comma-separated, or "*" for unrestricted dev mode)
+CORS_ALLOW_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
+]
 
 
 def _resolve_llm_config():
@@ -117,8 +169,17 @@ def _resolve_llm_config():
         else:
             model = "gpt-4o-mini"
 
-    use_ext = os.getenv("USE_EXTERNAL_LLM", "false").lower() in ("true", "1", "yes")
-    timeout = int(os.getenv("LLM_TIMEOUT_SEC", "25"))
+    raw_use_ext = os.getenv("USE_EXTERNAL_LLM")
+    if raw_use_ext is not None and raw_use_ext.strip() != "":
+        use_ext = raw_use_ext.strip().lower() in ("true", "1", "yes", "on")
+    else:
+        use_ext = bool(api_key)
+
+    try:
+        timeout = max(1, int(os.getenv("LLM_TIMEOUT_SEC", "20")))
+    except ValueError:
+        timeout = 20
+
     return use_ext, raw_base, api_key, model, timeout
 
 
@@ -132,19 +193,30 @@ GROQ_FALLBACK_MODELS = [
     "allam-2-7b"
 ]
 
+# Short 2-character domain terms preserved in FTS5 queries
+ALLOWED_SHORT_TERMS: Set[str] = {
+    "xg", "xa", "dt", "at", "pf", "id"
+}
+
 # Spanish Stopwords to prevent FTS5 BM25 noise on natural language queries
-SPANISH_STOPWORDS = {
+SPANISH_STOPWORDS: Set[str] = {
+    "a", "e", "o", "u", "y",
     "el", "la", "los", "las", "un", "una", "unos", "unas", "al", "del", "lo",
     "de", "en", "por", "para", "con", "sin", "sobre", "entre", "hacia", "desde",
-    "hasta", "ante", "bajo", "tras", "durante", "mediante", "que", "quien",
-    "quienes", "cual", "cuales", "como", "cuando", "donde", "cuanto", "cuanta",
-    "cuantos", "cuantas", "este", "esta", "estos", "estas", "ese", "esa", "esos",
-    "esas", "aquel", "aquella", "aquellos", "aquellas", "mi", "mis", "tu", "tus",
-    "su", "sus", "nuestro", "nuestra", "es", "son", "fue", "fueron", "era",
-    "eran", "ser", "estar", "esta", "estan", "estuvo", "hay", "tiene", "tienen",
-    "tener", "hacer", "hace", "hacen", "puede", "pueden", "podria", "mas", "menos",
-    "muy", "tambien", "pero", "sino", "porque", "pues", "si", "no", "ya", "todo",
-    "toda", "todos", "todas", "otro", "otra", "otros", "otras", "mismo", "misma"
+    "hasta", "ante", "bajo", "tras", "durante", "mediante", "segun", "contra",
+    "que", "quien", "quienes", "cual", "cuales", "como", "cuando", "donde",
+    "cuanto", "cuanta", "cuantos", "cuantas",
+    "este", "esta", "estos", "estas", "ese", "esa", "esos", "esas",
+    "aquel", "aquella", "aquellos", "aquellas",
+    "mi", "mis", "tu", "tus", "su", "sus", "nuestro", "nuestra",
+    "me", "te", "se", "le", "les", "nos",
+    "es", "son", "fue", "fueron", "era", "eran", "ser",
+    "estar", "estan", "estuvo", "esta", "hay",
+    "tiene", "tienen", "tener", "hacer", "hace", "hacen",
+    "puede", "pueden", "podria",
+    "mas", "menos", "muy", "tambien", "pero", "sino", "porque", "pues",
+    "si", "no", "ya", "todo", "toda", "todos", "todas",
+    "otro", "otra", "otros", "otras", "mismo", "misma"
 }
 
 # Proxy fix for huggingface / httpx environment
@@ -152,3 +224,4 @@ if "no_proxy" in os.environ and "[::1]" in os.environ.get("no_proxy", ""):
     clean_no_proxy = os.environ["no_proxy"].replace(",[::1]", "").replace("[::1]", "")
     os.environ["no_proxy"] = clean_no_proxy
     os.environ["NO_PROXY"] = clean_no_proxy
+

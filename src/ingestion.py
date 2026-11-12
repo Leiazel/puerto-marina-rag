@@ -1,20 +1,34 @@
 """
-Ingestion pipeline module for Club Atlético Puerto Marina (v2.0).
-- Parses markdown frontmatter and chunks documents with contextual prefixes.
-- Preserves Markdown table headers across chunks.
+Ingestion pipeline module for Club Atlético Puerto Marina (v2.2).
+- Parses markdown frontmatter safely and chunks documents with contextual prefixes.
+- Preserves Markdown table headers across split chunks.
+- Eliminates empty/separator-only/heading-only junk chunks.
 - Automatically indexes relational SQL tables (players, staff, departments) into RAG chunks.
 """
+import hashlib
 import re
 import json
-import hashlib
+from datetime import date as dt_date
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 import yaml
 
-from src.config import RAW_DOCS_DIR, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, DB_PATH, UPLOADS_DIR
+from src.config import (
+    BASE_DIR,
+    RAW_DOCS_DIR,
+    UPLOADS_DIR,
+    ALLOWED_UPLOAD_EXTENSIONS,
+    CHUNK_SIZE_CHARS,
+    CHUNK_OVERLAP_CHARS,
+    DB_PATH,
+)
 from src.database import get_db_connection, init_database
 from src.embeddings import get_embedding_engine
-from src.extractors import extract_document_content, ExtractionError
+from src.extractors import (
+    extract_document_content,
+    validate_file_magic_bytes,
+    ExtractionError,
+)
 from src.retriever import GLOBAL_VECTOR_CACHE
 
 INITIAL_DEPARTMENTS = [
@@ -137,30 +151,42 @@ def seed_metadata(conn) -> None:
     conn.commit()
 
 
+def _portable_file_path(file_path: Path) -> str:
+    """Stores path relative to BASE_DIR when inside the repo for portability across environments."""
+    try:
+        return file_path.resolve().relative_to(BASE_DIR.resolve()).as_posix()
+    except ValueError:
+        return str(file_path)
+
+
 def parse_markdown_file(file_path: Path) -> Dict[str, Any]:
     """Reads a markdown file with optional YAML frontmatter."""
-    text = file_path.read_text(encoding="utf-8")
-    frontmatter = {}
+    text = file_path.read_text(encoding="utf-8-sig")
+    frontmatter: Dict[str, Any] = {}
     content = text
 
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            raw_fm = parts[1].strip()
-            content = parts[2].strip()
-            try:
-                frontmatter = yaml.safe_load(raw_fm) or {}
-            except Exception as e:
-                print(f"Warning: could not parse frontmatter in {file_path}: {e}")
+    fm_match = re.match(r'^---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)', text, flags=re.DOTALL)
+    if fm_match:
+        raw_fm = fm_match.group(1).strip()
+        content = text[fm_match.end():].strip()
+        try:
+            loaded = yaml.safe_load(raw_fm)
+            if isinstance(loaded, dict):
+                frontmatter = loaded
+        except Exception as e:
+            print(f"Warning: could not parse frontmatter in {file_path}: {e}")
 
-    doc_code = frontmatter.get("id") or file_path.stem
-    title = frontmatter.get("title") or file_path.stem.replace("-", " ").title()
-    department_id = frontmatter.get("department") or file_path.parent.name
-    author = frontmatter.get("author") or "Club Atlético Puerto Marina"
+    doc_code = str(frontmatter.get("id") or file_path.stem)
+    title = str(frontmatter.get("title") or file_path.stem.replace("-", " ").title())
+    department_id = str(frontmatter.get("department") or file_path.parent.name)
+    author = str(frontmatter.get("author") or "Club Atlético Puerto Marina")
     date_str = str(frontmatter.get("date") or "2026-11-01")
-    confidentiality = frontmatter.get("confidentiality") or "interno"
+    confidentiality = str(frontmatter.get("confidentiality") or "interno")
     tags = frontmatter.get("tags")
-    tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags or "")
+    if isinstance(tags, list):
+        tags_str = ", ".join(str(t).strip() for t in tags if str(t).strip())
+    else:
+        tags_str = str(tags or "")
 
     return {
         "doc_code": doc_code,
@@ -171,203 +197,325 @@ def parse_markdown_file(file_path: Path) -> Dict[str, Any]:
         "confidentiality": confidentiality,
         "tags": tags_str,
         "raw_content": content,
-        "file_path": str(file_path)
+        "file_path": _portable_file_path(file_path)
     }
 
 
-def _split_oversized_text(text: str, max_chars: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> List[str]:
+def _is_heading_only(text: str) -> bool:
+    """Returns True if every non-empty line in text is a Markdown heading or horizontal rule."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return True
+    return all(bool(re.match(r'^(#{1,6}\s+|---+$)', l)) for l in lines)
+
+
+def _split_markdown_blocks(section_text: str) -> List[Tuple[str, str]]:
     """
-    Splits text that exceeds max_chars: first tries sentences, then falls back to sliding window.
+    Parses a section into typed blocks: ('table', text) or ('text', text).
+    Strips standalone horizontal rules (---) so they never become standalone chunks.
     """
-    if len(text) <= max_chars:
+    lines = section_text.splitlines()
+    blocks: List[Tuple[str, str]] = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        stripped = lines[i].strip()
+        if not stripped or re.match(r'^---+$', stripped):
+            i += 1
+            continue
+
+        # Markdown table block
+        if stripped.startswith("|"):
+            table_lines = []
+            while i < n and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i].rstrip())
+                i += 1
+            blocks.append(("table", "\n".join(table_lines)))
+            continue
+
+        # Prose / heading / list block
+        text_lines = []
+        while i < n:
+            cur_s = lines[i].strip()
+            if cur_s.startswith("|"):
+                break
+            if re.match(r'^---+$', cur_s):
+                i += 1
+                continue
+            if not cur_s:
+                if text_lines and text_lines[-1] != "":
+                    text_lines.append("")
+                i += 1
+                continue
+            text_lines.append(lines[i].rstrip())
+            i += 1
+
+        joined = "\n".join(text_lines).strip()
+        if joined:
+            blocks.append(("text", joined))
+
+    return blocks
+
+
+def _split_table_preserving_header(table_text: str, heading_prefix: str, max_body_chars: int) -> List[str]:
+    """Splits a Markdown table into multiple body chunks while preserving the header + separator row on every chunk."""
+    raw_lines = [l.strip() for l in table_text.splitlines() if l.strip()]
+    if len(raw_lines) <= 2:
+        full = f"{heading_prefix}\n{table_text}".strip() if heading_prefix else table_text
+        return [full]
+
+    header_rows: List[str] = []
+    data_start = 0
+    if len(raw_lines) >= 2 and "---" in raw_lines[1]:
+        header_rows = raw_lines[:2]
+        data_start = 2
+    else:
+        header_rows = [raw_lines[0]]
+        cols = max(1, raw_lines[0].count("|") - 1)
+        header_rows.append("|" + "---|" * cols)
+        data_start = 1
+
+    data_rows = raw_lines[data_start:]
+    if not data_rows:
+        full = f"{heading_prefix}\n" + "\n".join(header_rows)
+        return [full.strip()]
+
+    table_header_str = "\n".join(header_rows)
+    base_prefix = f"{heading_prefix}\n{table_header_str}".strip() if heading_prefix else table_header_str
+
+    chunks: List[str] = []
+    current_rows: List[str] = []
+    current_len = len(base_prefix)
+
+    for row in data_rows:
+        row_len = len(row) + 1
+        if current_rows and current_len + row_len > max_body_chars:
+            chunks.append(base_prefix + "\n" + "\n".join(current_rows))
+            current_rows = [row]
+            current_len = len(base_prefix) + row_len
+        else:
+            current_rows.append(row)
+            current_len += row_len
+
+    if current_rows:
+        chunks.append(base_prefix + "\n" + "\n".join(current_rows))
+
+    return chunks
+
+
+def _split_long_line(line: str, max_chars: int, overlap_chars: int) -> List[str]:
+    """Splits a single oversized paragraph/line by sentence boundaries, then sliding word window."""
+    if len(line) <= max_chars:
+        return [line]
+
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', line) if s.strip()]
+    parts: List[str] = []
+    buf: List[str] = []
+    cur_len = 0
+
+    for sent in sentences:
+        if len(sent) > max_chars:
+            if buf:
+                parts.append(" ".join(buf))
+                buf = []
+                cur_len = 0
+            start = 0
+            step = max(50, max_chars - overlap_chars)
+            while start < len(sent):
+                end = min(start + max_chars, len(sent))
+                parts.append(sent[start:end])
+                if end == len(sent):
+                    break
+                start += step
+            continue
+
+        if buf and cur_len + len(sent) + 1 > max_chars:
+            parts.append(" ".join(buf))
+            if len(buf[-1]) <= overlap_chars:
+                buf = [buf[-1], sent]
+                cur_len = len(buf[0]) + len(sent) + 1
+            else:
+                buf = [sent]
+                cur_len = len(sent)
+        else:
+            buf.append(sent)
+            cur_len += len(sent) + 1
+
+    if buf:
+        parts.append(" ".join(buf))
+    return parts
+
+
+def _split_text_lines(text: str, max_body_chars: int, overlap_chars: int) -> List[str]:
+    """Splits long prose or list blocks by line boundaries (and sentence/window fallback) with clean overlap."""
+    if len(text) <= max_body_chars:
         return [text]
 
-    sentence_endings = re.compile(r'(?<=[.!?])\s+')
-    sentences = sentence_endings.split(text)
+    raw_lines = [l for l in text.splitlines() if l.strip()]
+    if not raw_lines:
+        return []
 
-    chunks = []
-    current_chunk = []
+    lines: List[str] = []
+    for raw_l in raw_lines:
+        if len(raw_l) > max_body_chars:
+            lines.extend(_split_long_line(raw_l, max_body_chars, overlap_chars))
+        else:
+            lines.append(raw_l)
+
+    chunks: List[str] = []
+    current_lines: List[str] = []
     current_len = 0
 
-    for s in sentences:
-        s_clean = s.strip()
-        if not s_clean:
-            continue
-        s_len = len(s_clean)
-
-        if s_len > max_chars:
-            if current_chunk:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = []
-                current_len = 0
-            # Hard window split for long single sentence / table row
-            start = 0
-            while start < s_len:
-                end = min(start + max_chars, s_len)
-                chunks.append(s_clean[start:end])
-                start += max_chars - overlap
-            continue
-
-        if current_len + s_len + 1 > max_chars and current_chunk:
-            chunks.append(" ".join(current_chunk))
-            if len(current_chunk[-1]) <= overlap:
-                current_chunk = [current_chunk[-1], s_clean]
-                current_len = len(current_chunk[0]) + s_len + 1
-            else:
-                current_chunk = [s_clean]
-                current_len = s_len
+    for line in lines:
+        line_len = len(line) + 1
+        if current_lines and current_len + line_len > max_body_chars:
+            chunks.append("\n".join(current_lines))
+            # Retain trailing lines up to overlap_chars
+            overlap_buf: List[str] = []
+            overlap_len = 0
+            for prev_line in reversed(current_lines):
+                if overlap_len + len(prev_line) + 1 <= overlap_chars:
+                    overlap_buf.insert(0, prev_line)
+                    overlap_len += len(prev_line) + 1
+                else:
+                    break
+            current_lines = overlap_buf + [line]
+            current_len = sum(len(x) + 1 for x in current_lines)
         else:
-            current_chunk.append(s_clean)
-            current_len += s_len + 1
+            current_lines.append(line)
+            current_len += line_len
 
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
+    if current_lines:
+        chunks.append("\n".join(current_lines))
 
     return chunks
 
 
 def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Chunks document content with:
-    - Section header preservation & hierarchical title enrichment.
-    - Sentence-aware and sliding-window splitting for oversized text.
-    - Markdown table header retention across split chunks.
-    - Automatic rejection of empty or junk chunks (e.g. standalone dividers or empty headings).
-    - Explicit contextual prefix injection for dense vector and lexical alignment.
+    Chunks markdown content by headers (##, ###), preserves table headers across splits,
+    eliminates heading-only/separator-only junk chunks, and enriches each chunk with a
+    contextual prefix.
     """
     content = doc_meta["raw_content"]
     title = doc_meta["title"]
     dept = doc_meta["department_id"]
-    author = doc_meta.get("author") or "Club Atlético Puerto Marina"
-    date_str = str(doc_meta.get("date") or "2026-11-01")
-    tags = doc_meta.get("tags") or ""
+    author = doc_meta["author"]
+    date_str = doc_meta["date"]
+    tags = doc_meta["tags"]
 
-    section_pattern = re.compile(r'(?=^#{2,3}\s+)', re.MULTILINE)
+    prefix = (
+        f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
+        f"TAGS: {tags}\n\n"
+    )
+    max_body_chars = max(550, CHUNK_SIZE_CHARS - len(prefix))
+
+    section_pattern = re.compile(r'(?=^#{1,3}\s+)', re.MULTILINE)
     raw_sections = [s.strip() for s in section_pattern.split(content) if s.strip()]
-
     if not raw_sections:
-        raw_sections = [content]
+        raw_sections = [content.strip()] if content.strip() else []
 
-    final_chunks = []
-    chunk_idx = 0
-
+    # Merge heading-only sections forward so headers never stand alone as junk chunks
+    merged_sections: List[str] = []
+    pending_header = ""
     for sec in raw_sections:
-        # Determine section title if a heading exists
-        header_match = re.search(r'^(#{2,3})\s+(.+)$', sec, re.MULTILINE)
-        section_title = header_match.group(2).strip() if header_match else f"Sección {chunk_idx + 1}"
-        chunk_title = f"{title} - {section_title}" if section_title != title else f"{title} (Parte {chunk_idx + 1})"
+        cleaned_lines = [l for l in sec.splitlines() if not re.match(r'^\s*---+\s*$', l)]
+        cleaned_sec = "\n".join(cleaned_lines).strip()
+        if not cleaned_sec:
+            continue
+        if _is_heading_only(cleaned_sec):
+            pending_header = f"{pending_header}\n{cleaned_sec}".strip() if pending_header else cleaned_sec
+        else:
+            if pending_header:
+                cleaned_sec = f"{pending_header}\n{cleaned_sec}"
+                pending_header = ""
+            merged_sections.append(cleaned_sec)
 
-        # Check for junk / trivial section (< 25 alphanumeric chars)
-        alnum_count = sum(1 for ch in sec if ch.isalnum())
-        if alnum_count < 25:
+    if pending_header:
+        if merged_sections:
+            merged_sections[-1] = f"{merged_sections[-1]}\n\n{pending_header}"
+        else:
+            merged_sections.append(pending_header)
+
+    body_chunks: List[str] = []
+    for sec in merged_sections:
+        if len(sec) <= max_body_chars:
+            body_chunks.append(sec)
             continue
 
-        if len(sec) <= CHUNK_SIZE_CHARS:
-            augmented_content = (
-                f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
-                f"TAGS: {tags}\n\n"
-                f"{sec}"
-            )
-            final_chunks.append({
-                "chunk_index": chunk_idx,
-                "title": chunk_title,
-                "department_id": dept,
-                "content": augmented_content,
-                "metadata": {
-                    "doc_code": doc_meta.get("doc_code", f"DOC-{chunk_idx+1}"),
-                    "date": date_str,
-                    "author": author,
-                    "tags": tags,
-                    "source_type": doc_meta.get("source_type", "markdown")
-                }
-            })
-            chunk_idx += 1
-        else:
-            paragraphs = sec.split("\n\n")
-            current_buffer = []
-            current_len = 0
-            last_table_header = None
+        blocks = _split_markdown_blocks(sec)
+        current_buf: List[str] = []
+        current_len = 0
+        pending_sec_heading = ""
 
-            for p in paragraphs:
-                p_clean = p.strip()
-                if not p_clean:
-                    continue
+        for b_type, b_text in blocks:
+            if b_type == "text" and _is_heading_only(b_text):
+                pending_sec_heading = f"{pending_sec_heading}\n{b_text}".strip() if pending_sec_heading else b_text
+                continue
 
-                # Detect and track table headers to preserve them if table is split
-                if p_clean.startswith("|") and "\n|" in p_clean and "---" in p_clean:
-                    lines = p_clean.split("\n")
-                    if len(lines) >= 2 and "---" in lines[1]:
-                        last_table_header = lines[0] + "\n" + lines[1]
+            if b_type == "table":
+                if current_buf:
+                    body_chunks.append("\n\n".join(current_buf))
+                    current_buf = []
+                    current_len = 0
 
-                # If paragraph itself is oversized, split it using sentence/window splitter
-                sub_parts = _split_oversized_text(p_clean, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS)
+                table_chunks = _split_table_preserving_header(b_text, pending_sec_heading, max_body_chars)
+                pending_sec_heading = ""
+                body_chunks.extend(table_chunks)
+                continue
 
-                for part in sub_parts:
-                    part_len = len(part)
-                    if current_len + part_len > CHUNK_SIZE_CHARS and current_buffer:
-                        chunk_text = "\n\n".join(current_buffer)
-                        augmented_content = (
-                            f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
-                            f"TAGS: {tags}\n\n"
-                            f"{chunk_text}"
-                        )
-                        final_chunks.append({
-                            "chunk_index": chunk_idx,
-                            "title": f"{chunk_title} (Parte {chunk_idx + 1})",
-                            "department_id": dept,
-                            "content": augmented_content,
-                            "metadata": {
-                                "doc_code": doc_meta.get("doc_code", f"DOC-{chunk_idx+1}"),
-                                "date": date_str,
-                                "author": author,
-                                "tags": tags,
-                                "source_type": doc_meta.get("source_type", "markdown")
-                            }
-                        })
-                        chunk_idx += 1
+            # Text block
+            full_text = f"{pending_sec_heading}\n{b_text}".strip() if pending_sec_heading else b_text
+            pending_sec_heading = ""
 
-                        # Carry forward table header if next part is table rows without header
-                        if last_table_header and part.startswith("|") and "---" not in part:
-                            current_buffer = [last_table_header, part]
-                            current_len = len(last_table_header) + part_len + 2
-                        elif len(current_buffer[-1]) < CHUNK_OVERLAP_CHARS:
-                            current_buffer = [current_buffer[-1], part]
-                            current_len = len(current_buffer[0]) + part_len + 2
-                        else:
-                            current_buffer = [part]
-                            current_len = part_len
-                    else:
-                        current_buffer.append(part)
-                        current_len += part_len + 2
+            if len(full_text) > max_body_chars:
+                if current_buf:
+                    body_chunks.append("\n\n".join(current_buf))
+                    current_buf = []
+                    current_len = 0
+                body_chunks.extend(_split_text_lines(full_text, max_body_chars, CHUNK_OVERLAP_CHARS))
+            elif current_buf and current_len + len(full_text) + 2 > max_body_chars:
+                body_chunks.append("\n\n".join(current_buf))
+                current_buf = [full_text]
+                current_len = len(full_text)
+            else:
+                current_buf.append(full_text)
+                current_len += len(full_text) + 2
 
-            if current_buffer:
-                chunk_text = "\n\n".join(current_buffer)
-                if sum(1 for ch in chunk_text if ch.isalnum()) >= 25:
-                    augmented_content = (
-                        f"DOCUMENTO: {title} | ÁREA: {dept} | FECHA: {date_str} | AUTOR: {author}\n"
-                        f"TAGS: {tags}\n\n"
-                        f"{chunk_text}"
-                    )
-                    final_chunks.append({
-                        "chunk_index": chunk_idx,
-                        "title": f"{chunk_title} (Parte {chunk_idx + 1})",
-                        "department_id": dept,
-                        "content": augmented_content,
-                        "metadata": {
-                            "doc_code": doc_meta.get("doc_code", f"DOC-{chunk_idx+1}"),
-                            "date": date_str,
-                            "author": author,
-                            "tags": tags,
-                            "source_type": doc_meta.get("source_type", "markdown")
-                        }
-                    })
-                    chunk_idx += 1
+        if pending_sec_heading:
+            if current_buf:
+                current_buf.append(pending_sec_heading)
+            elif body_chunks:
+                body_chunks[-1] = f"{body_chunks[-1]}\n\n{pending_sec_heading}"
+
+        if current_buf:
+            body_chunks.append("\n\n".join(current_buf))
+
+    final_chunks = []
+    for body in body_chunks:
+        if _is_heading_only(body):
+            continue
+        label = "Sección" if len(body_chunks) == 1 else "Parte"
+        final_chunks.append({
+            "chunk_index": len(final_chunks),
+            "title": f"{title} ({label} {len(final_chunks) + 1})",
+            "department_id": dept,
+            "content": f"{prefix}{body}",
+            "metadata": {
+                "doc_code": doc_meta["doc_code"],
+                "date": date_str,
+                "author": author,
+                "tags": tags,
+                "source_type": doc_meta.get("source_type", "markdown")
+            }
+        })
 
     return final_chunks
 
 
 def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[int, int]:
-    """Inserts or updates a parsed document dict and indexes its chunks into SQLite & FTS5."""
+    """Inserts or updates a parsed document dict and indexes its chunks into SQLite & FTS5 atomically."""
     cur = conn.cursor()
 
     cur.execute("SELECT id FROM departments WHERE id = ?", (doc_meta["department_id"],))
@@ -375,89 +523,98 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
         doc_meta["department_id"] = "cuerpo_tecnico"
 
     source_type = doc_meta.get("source_type", "markdown")
-    original_filename = doc_meta.get("original_filename") or (Path(doc_meta["file_path"]).name if doc_meta.get("file_path") else "")
-    content_hash = doc_meta.get("content_hash") or hashlib.sha256(doc_meta["raw_content"].encode("utf-8")).hexdigest()
+    file_path_str = str(doc_meta.get("file_path") or "")
+    original_filename = doc_meta.get("original_filename") or (
+        Path(file_path_str).name if file_path_str and not file_path_str.startswith("sqlite://") else ""
+    )
+    content_hash = doc_meta.get("content_hash") or hashlib.sha256(
+        doc_meta["raw_content"].encode("utf-8")
+    ).hexdigest()
     file_size_bytes = int(doc_meta.get("file_size_bytes") or len(doc_meta["raw_content"].encode("utf-8")))
 
-    cur.execute("""
-        INSERT INTO documents (
-            doc_code, title, department_id, author, date, file_path,
-            confidentiality, tags, raw_content, source_type,
-            original_filename, content_hash, file_size_bytes
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(doc_code) DO UPDATE SET
-            title=excluded.title,
-            department_id=excluded.department_id,
-            author=excluded.author,
-            date=excluded.date,
-            file_path=excluded.file_path,
-            confidentiality=excluded.confidentiality,
-            tags=excluded.tags,
-            raw_content=excluded.raw_content,
-            source_type=excluded.source_type,
-            original_filename=excluded.original_filename,
-            content_hash=excluded.content_hash,
-            file_size_bytes=excluded.file_size_bytes
-        RETURNING id;
-    """, (
-        doc_meta["doc_code"],
-        doc_meta["title"],
-        doc_meta["department_id"],
-        doc_meta["author"],
-        doc_meta["date"],
-        doc_meta["file_path"],
-        doc_meta.get("confidentiality", "interno"),
-        doc_meta.get("tags", ""),
-        doc_meta["raw_content"],
-        source_type,
-        original_filename,
-        content_hash,
-        file_size_bytes
-    ))
-    row = cur.fetchone()
-    doc_id = row[0] if row else None
-
-    if not doc_id:
-        cur.execute("SELECT id FROM documents WHERE doc_code = ?", (doc_meta["doc_code"],))
-        doc_id = cur.fetchone()["id"]
-
-    # Delete previous chunks and FTS5 entries
-    cur.execute("SELECT id FROM chunks WHERE document_id = ?", (doc_id,))
-    old_chunk_ids = [r["id"] for r in cur.fetchall()]
-    for cid in old_chunk_ids:
-        cur.execute("DELETE FROM chunks_fts WHERE rowid = ?", (cid,))
-    cur.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
-
-    chunks = chunk_document(doc_meta)
-    if not chunks:
-        GLOBAL_VECTOR_CACHE.invalidate()
-        conn.commit()
-        return doc_id, 0
-
-    chunk_texts = [c["content"] for c in chunks]
-    vectors = embedder.embed_batch(chunk_texts)
-
-    for c, vec in zip(chunks, vectors):
-        blob = embedder.vector_to_blob(vec)
-        meta_json = json.dumps(c["metadata"], ensure_ascii=False)
-
+    try:
         cur.execute("""
-            INSERT INTO chunks (document_id, chunk_index, title, department_id, content, embedding, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents (
+                doc_code, title, department_id, author, date, file_path,
+                confidentiality, tags, raw_content, source_type,
+                original_filename, content_hash, file_size_bytes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(doc_code) DO UPDATE SET
+                title=excluded.title,
+                department_id=excluded.department_id,
+                author=excluded.author,
+                date=excluded.date,
+                file_path=excluded.file_path,
+                confidentiality=excluded.confidentiality,
+                tags=excluded.tags,
+                raw_content=excluded.raw_content,
+                source_type=excluded.source_type,
+                original_filename=excluded.original_filename,
+                content_hash=excluded.content_hash,
+                file_size_bytes=excluded.file_size_bytes
             RETURNING id;
-        """, (doc_id, c["chunk_index"], c["title"], c["department_id"], c["content"], blob, meta_json))
-        chunk_id = cur.fetchone()[0]
+        """, (
+            doc_meta["doc_code"],
+            doc_meta["title"],
+            doc_meta["department_id"],
+            doc_meta["author"],
+            doc_meta["date"],
+            file_path_str,
+            doc_meta.get("confidentiality", "interno"),
+            doc_meta.get("tags", ""),
+            doc_meta["raw_content"],
+            source_type,
+            original_filename,
+            content_hash,
+            file_size_bytes
+        ))
+        row = cur.fetchone()
+        doc_id = row[0] if row else None
 
-        # Insert into FTS5 with explicit rowid = chunk_id for zero-cast JOINs
-        cur.execute("""
-            INSERT INTO chunks_fts (rowid, chunk_id, title, department_id, content, tags)
-            VALUES (?, ?, ?, ?, ?, ?);
-        """, (chunk_id, str(chunk_id), c["title"], c["department_id"], c["content"], doc_meta["tags"]))
+        if not doc_id:
+            cur.execute("SELECT id FROM documents WHERE doc_code = ?", (doc_meta["doc_code"],))
+            doc_id = cur.fetchone()["id"]
 
-    conn.commit()
-    GLOBAL_VECTOR_CACHE.invalidate()
-    return doc_id, len(chunks)
+        # Delete previous chunks and FTS5 entries
+        cur.execute("SELECT id FROM chunks WHERE document_id = ?", (doc_id,))
+        old_chunk_ids = [r["id"] for r in cur.fetchall()]
+        for cid in old_chunk_ids:
+            cur.execute("DELETE FROM chunks_fts WHERE rowid = ?", (cid,))
+        cur.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
+
+        chunks = chunk_document(doc_meta)
+        if not chunks:
+            conn.commit()
+            GLOBAL_VECTOR_CACHE.invalidate()
+            return doc_id, 0
+
+        chunk_texts = [c["content"] for c in chunks]
+        vectors = embedder.embed_batch(chunk_texts)
+
+        for c, vec in zip(chunks, vectors):
+            blob = embedder.vector_to_blob(vec)
+            meta_json = json.dumps(c["metadata"], ensure_ascii=False)
+
+            cur.execute("""
+                INSERT INTO chunks (document_id, chunk_index, title, department_id, content, embedding, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                RETURNING id;
+            """, (doc_id, c["chunk_index"], c["title"], c["department_id"], c["content"], blob, meta_json))
+            chunk_id = cur.fetchone()[0]
+
+            # Insert into FTS5 with explicit rowid = chunk_id for zero-cast JOINs
+            cur.execute("""
+                INSERT INTO chunks_fts (rowid, chunk_id, title, department_id, content, tags)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, (chunk_id, str(chunk_id), c["title"], c["department_id"], c["content"], doc_meta.get("tags", "")))
+
+        conn.commit()
+        GLOBAL_VECTOR_CACHE.invalidate()
+        return doc_id, len(chunks)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def ingest_uploaded_file(
@@ -468,35 +625,40 @@ def ingest_uploaded_file(
     tags: str,
     conn,
     embedder,
-    file_bytes: Optional[bytes] = None
+    file_bytes: Optional[bytes] = None,
+    write_to_disk: bool = False
 ) -> Tuple[int, int, str]:
     """
-    Ingests an uploaded document (PDF, DOCX, DOC, MD, TXT):
-    1. Extracts structured Markdown using src.extractors.
-    2. Computes SHA-256 hash.
-    3. Handles deduplication.
-    4. Indexes chunks and FTS5.
-    5. Returns (doc_id, chunk_count, doc_code).
+    Validates, extracts, optionally writes, deduplicates (department-scoped SHA-256),
+    and indexes an uploaded file (.pdf, .docx, .doc, .md, .txt).
+    Extraction and magic-byte validation happen BEFORE writing to disk so invalid files leave no residue.
     """
     if file_bytes is None:
         file_bytes = file_path.read_bytes()
 
+    validate_file_magic_bytes(original_filename, file_bytes)
+    extraction = extract_document_content(file_bytes, original_filename)
+
     content_hash = hashlib.sha256(file_bytes).hexdigest()
     file_size_bytes = len(file_bytes)
-
-    extraction = extract_document_content(file_bytes, original_filename)
     raw_markdown = extraction["text"]
     inferred_title = extraction.get("inferred_title", Path(original_filename).stem.replace("-", " ").title())
     source_format = extraction.get("format", Path(original_filename).suffix.lstrip("."))
 
+    if write_to_disk:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(file_bytes)
+
     cur = conn.cursor()
-    cur.execute("SELECT id, doc_code FROM documents WHERE content_hash = ?", (content_hash,))
-    existing = cur.fetchone()
+    existing = cur.execute(
+        "SELECT doc_code FROM documents WHERE content_hash = ? AND department_id = ?",
+        (content_hash, department_id)
+    ).fetchone()
     if existing:
         doc_code = existing["doc_code"]
     else:
-        dept_prefix = department_id[:3].upper() if department_id else "GEN"
-        slug = re.sub(r'[^a-zA-Z0-9]', '', Path(original_filename).stem)[:12].upper()
+        dept_prefix = (department_id[:3] if department_id else "GEN").upper()
+        slug = re.sub(r'[^a-zA-Z0-9]', '', Path(original_filename).stem)[:12].upper() or "FILE"
         doc_code = f"UPL-{dept_prefix}-{slug}-{content_hash[:6].upper()}"
 
     doc_meta = {
@@ -504,11 +666,11 @@ def ingest_uploaded_file(
         "title": inferred_title,
         "department_id": department_id,
         "author": author or "Staff Técnico",
-        "date": "2026-11-09",
+        "date": dt_date.today().isoformat(),
         "confidentiality": "interno",
-        "tags": tags,
+        "tags": tags or "",
         "raw_content": raw_markdown,
-        "file_path": str(file_path),
+        "file_path": _portable_file_path(file_path),
         "source_type": source_format,
         "original_filename": original_filename,
         "content_hash": content_hash,
@@ -525,9 +687,32 @@ def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
     return ingest_doc_metadata_dict(doc_meta, conn, embedder)
 
 
+def delete_document_by_id(doc_id: int, conn) -> Optional[Dict[str, Any]]:
+    """Deletes a document and cleans up its chunks, FTS5 entries, and vector matrix cache."""
+    cur = conn.cursor()
+    cur.execute("SELECT id, doc_code, title, file_path FROM documents WHERE id = ?", (doc_id,))
+    doc = cur.fetchone()
+    if not doc:
+        return None
+
+    try:
+        cur.execute("SELECT id FROM chunks WHERE document_id = ?", (doc_id,))
+        chunk_ids = [r["id"] for r in cur.fetchall()]
+        for cid in chunk_ids:
+            cur.execute("DELETE FROM chunks_fts WHERE rowid = ?", (cid,))
+        cur.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
+        cur.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        conn.commit()
+        GLOBAL_VECTOR_CACHE.invalidate()
+        return dict(doc)
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
     """
-    NEW IN V2.0: Synchronizes relational SQL tables (players, staff, departments)
+    Synchronizes relational SQL tables (players, staff, departments)
     into virtual RAG documents so any natural language query about player biometrics,
     dorsals, roles, emails, or phone numbers is retrieved by both BM25 and Vector search.
     """
@@ -540,22 +725,13 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "| Dorsal | Nombre | Apodo | Posición | Edad | Altura (m) | Peso (kg) | Observaciones Clínicas y Tácticas |",
         "|---|---|---|---|---|---|---|---|"
     ]
+    player_bullets = ["## Detalle Individual de Futbolistas del Plantel"]
     for p in players:
         roster_lines.append(
             f"| #{p['dorsal']} | {p['name']} | {p['nickname']} | {p['position']} | {p['age']} años | {p['height_m']} m | {p['weight_kg']} kg | {p['notes']} |"
         )
-
-    player_sections = ["\n## Fichas Individuales de Futbolistas del Plantel"]
-    for p in players:
-        player_sections.append(
-            f"### Futbolista: #{p['dorsal']} {p['name']} (\"{p['nickname']}\")\n"
-            f"- **Dorsal**: #{p['dorsal']}\n"
-            f"- **Nombre Completo**: {p['name']}\n"
-            f"- **Posición**: {p['position']}\n"
-            f"- **Edad**: {p['age']} años\n"
-            f"- **Estatura / Altura**: {p['height_m']} m\n"
-            f"- **Peso Corporal**: {p['weight_kg']} kg\n"
-            f"- **Observaciones Clínicas y Tácticas**: {p['notes']}\n"
+        player_bullets.append(
+            f"- **Dorsal #{p['dorsal']} - {p['name']} (\"{p['nickname']}\")**: Juega como {p['position']}, tiene {p['age']} años, mide {p['height_m']} m y pesa {p['weight_kg']} kg. Nota oficial: {p['notes']}"
         )
 
     roster_doc = {
@@ -566,7 +742,7 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "date": "2026-11-06",
         "confidentiality": "interno",
         "tags": "plantel, jugadores, dorsales, altura, peso, edad, posicion, arquero, delantero, defensor, mediocampista",
-        "raw_content": "\n".join(roster_lines) + "\n\n" + "\n\n".join(player_sections),
+        "raw_content": "\n".join(roster_lines) + "\n\n" + "\n".join(player_bullets),
         "file_path": "sqlite://players",
         "source_type": "relational_sql"
     }
@@ -584,21 +760,13 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "| Profesional | Cargo / Rol | Departamento | Correo Electrónico (Email) | Teléfono Directo |",
         "|---|---|---|---|---|"
     ]
+    staff_bullets = ["## Contacto Directo y Responsabilidades del Staff"]
     for s in staff_rows:
         staff_lines.append(
             f"| {s['name']} | {s['role']} | {s['dept_name']} | {s['email']} | {s['phone']} |"
         )
-
-    staff_sections = ["\n## Contacto Directo y Responsabilidades Individuales del Staff"]
-    for s in staff_rows:
-        staff_sections.append(
-            f"### Integrante del Staff: {s['name']} ({s['role']})\n"
-            f"- **Nombre Completo**: {s['name']}\n"
-            f"- **Cargo / Función**: {s['role']}\n"
-            f"- **Departamento**: {s['dept_name']}\n"
-            f"- **Correo Electrónico Oficial (Email)**: {s['email']}\n"
-            f"- **Teléfono Directo de Contacto**: {s['phone']}\n"
-            f"- **Misión y Competencia del Área**: {s['dept_desc']}\n"
+        staff_bullets.append(
+            f"- **{s['name']}** ({s['role']} en {s['dept_name']}): Email `{s['email']}` | Teléfono `{s['phone']}`. Área encargada de: {s['dept_desc']}"
         )
 
     staff_doc = {
@@ -609,7 +777,7 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "date": "2026-11-06",
         "confidentiality": "interno",
         "tags": "staff, directorio, telefono, email, correo, contacto, medico, nutricionista, kinesiologa, entrenador, preparador_fisico",
-        "raw_content": "\n".join(staff_lines) + "\n\n" + "\n\n".join(staff_sections),
+        "raw_content": "\n".join(staff_lines) + "\n\n" + "\n".join(staff_bullets),
         "file_path": "sqlite://staff",
         "source_type": "relational_sql"
     }
@@ -619,42 +787,99 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
     return 2, (c1 + c2)
 
 
-def run_full_ingestion(db_path: Path = DB_PATH) -> Dict[str, Any]:
-    """Runs end-to-end ingestion over all markdown files AND relational SQL tables."""
-    print(f"1. Inicializando esquema SQLite + FTS5 en {db_path}...")
+def run_full_ingestion(
+    db_path: Path = DB_PATH,
+    docs_dir: Path = RAW_DOCS_DIR,
+    uploads_dir: Optional[Path] = None
+) -> Dict[str, Any]:
+    """Runs end-to-end ingestion over markdown files, uploaded files, and SQL tables, cleaning orphan docs."""
+    effective_uploads_dir = uploads_dir if uploads_dir is not None else (UPLOADS_DIR if docs_dir == RAW_DOCS_DIR else None)
+
+    print("1. Inicializando esquema SQLite + FTS5...")
     init_database(db_path)
     conn = get_db_connection(db_path)
-    seed_metadata(conn)
+    try:
+        seed_metadata(conn)
 
-    print("2. Cargando motor de embeddings multilingüe (FastEmbed ONNX)...")
-    embedder = get_embedding_engine()
+        print("2. Cargando motor de embeddings multilingüe (FastEmbed ONNX)...")
+        embedder = get_embedding_engine()
 
-    total_docs = 0
-    total_chunks = 0
-    all_files = sorted(list(RAW_DOCS_DIR.rglob("*.md")))
+        total_docs = 0
+        total_chunks = 0
+        active_doc_codes = {"SQL-PLANTEL-2026", "SQL-STAFF-2026"}
+        all_files = sorted(list(docs_dir.rglob("*.md"))) if docs_dir.exists() else []
 
-    print(f"3. Indexando {len(all_files)} documentos Markdown desde {RAW_DOCS_DIR}...")
-    for f in all_files:
-        doc_id, count = ingest_document_file(f, conn, embedder)
-        total_docs += 1
-        total_chunks += count
-        print(f"   -> [MD] {f.name} (Doc ID {doc_id}: {count} chunks)")
+        print(f"3. Indexando {len(all_files)} documentos Markdown desde {docs_dir}...")
+        for f in all_files:
+            doc_meta = parse_markdown_file(f)
+            active_doc_codes.add(doc_meta["doc_code"])
+            doc_id, count = ingest_doc_metadata_dict(doc_meta, conn, embedder)
+            total_docs += 1
+            total_chunks += count
+            print(f"   -> [MD] {f.name} (Doc ID {doc_id}: {count} chunks)")
 
-    print("4. Sincronizando tablas relacionales SQL (players, staff, departments) al índice RAG...")
-    sql_docs, sql_chunks = sync_relational_entities_to_rag(conn, embedder)
-    total_docs += sql_docs
-    total_chunks += sql_chunks
-    print(f"   -> [SQL] {sql_docs} documentos virtuales generados ({sql_chunks} chunks)")
+        if effective_uploads_dir and effective_uploads_dir.exists():
+            uploaded_files = sorted(
+                f for f in effective_uploads_dir.rglob("*")
+                if f.is_file() and f.suffix.lower() in ALLOWED_UPLOAD_EXTENSIONS
+            )
+            if uploaded_files:
+                print(f"   Reindexando {len(uploaded_files)} documentos cargados desde {effective_uploads_dir}...")
+            for uf in uploaded_files:
+                dept_guess = uf.parent.name if uf.parent != effective_uploads_dir else "cuerpo_tecnico"
+                try:
+                    existing_meta = conn.execute(
+                        "SELECT author, tags FROM documents WHERE file_path = ? OR original_filename = ? LIMIT 1",
+                        (_portable_file_path(uf), uf.name)
+                    ).fetchone()
+                    u_author = existing_meta["author"] if existing_meta else "Staff Técnico"
+                    u_tags = existing_meta["tags"] if existing_meta else ""
+                    doc_id, count, doc_code = ingest_uploaded_file(
+                        file_path=uf,
+                        original_filename=uf.name,
+                        department_id=dept_guess,
+                        author=u_author,
+                        tags=u_tags,
+                        conn=conn,
+                        embedder=embedder
+                    )
+                    active_doc_codes.add(doc_code)
+                    total_docs += 1
+                    total_chunks += count
+                    print(f"   -> [UPLOAD] {uf.name} (Doc ID {doc_id}: {count} chunks)")
+                except ExtractionError as ee:
+                    print(f"   Warning: no se pudo reindexar archivo cargado {uf.name}: {ee}")
 
-    conn.close()
-    GLOBAL_VECTOR_CACHE.invalidate(str(db_path))
-    print(f"Ingesta completada con éxito: {total_docs} documentos y {total_chunks} fragmentos activos.")
-    return {
-        "documents_count": total_docs,
-        "chunks_count": total_chunks,
-        "db_path": str(db_path)
-    }
+        print("4. Sincronizando tablas relacionales SQL (players, staff, departments) al índice RAG...")
+        sql_docs, sql_chunks = sync_relational_entities_to_rag(conn, embedder)
+        total_docs += sql_docs
+        total_chunks += sql_chunks
+        print(f"   -> [SQL] {sql_docs} documentos virtuales generados ({sql_chunks} chunks)")
+
+        # 5. Clean up orphan documents whose files were removed from disk
+        cur = conn.cursor()
+        existing_docs = cur.execute("SELECT id, doc_code FROM documents").fetchall()
+        removed_count = 0
+        for row in existing_docs:
+            if row["doc_code"] not in active_doc_codes:
+                delete_document_by_id(row["id"], conn)
+                removed_count += 1
+
+        if removed_count:
+            print(f"5. Limpieza completada: {removed_count} documentos huérfanos eliminados del índice.")
+
+        GLOBAL_VECTOR_CACHE.invalidate()
+        print(f"Ingesta completada con éxito: {total_docs} documentos y {total_chunks} fragmentos activos.")
+        return {
+            "documents_count": total_docs,
+            "chunks_count": total_chunks,
+            "removed_orphans": removed_count,
+            "db_path": str(db_path)
+        }
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
     run_full_ingestion()
+

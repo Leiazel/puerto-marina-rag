@@ -1,12 +1,14 @@
 """
-Hybrid Retriever module (v2.0) combining:
-- SQLite FTS5 (BM25) with Spanish Stopword filtering and rowid integer joins.
+Hybrid Retriever module (v2.2) combining:
+- SQLite FTS5 (BM25) with Spanish Stopword filtering, preserved 2-char domain acronyms, and rowid integer joins.
 - Two-Phase Dense Vector Cosine Similarity (loads only IDs & BLOBs first, then fetches text for Top-K).
-- Reciprocal Rank Fusion (RRF) and metadata filtering.
+- Reciprocal Rank Fusion (RRF) with true pure-lexical (alpha=1.0) and pure-vector (alpha=0.0) modes.
 """
+import threading
 import time
 import json
 import sqlite3
+import unicodedata
 import numpy as np
 from typing import List, Dict, Any, Optional
 
@@ -15,14 +17,12 @@ from src.config import (
     DEFAULT_TOP_K,
     DEFAULT_HYBRID_ALPHA,
     RRF_K_CONSTANT,
-    SPANISH_STOPWORDS
+    SPANISH_STOPWORDS,
+    ALLOWED_SHORT_TERMS
 )
 from src.database import get_db_connection
 from src.embeddings import get_embedding_engine
 
-
-import threading
-import unicodedata
 
 def _strip_accents(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
@@ -30,9 +30,9 @@ def _strip_accents(text: str) -> str:
 
 class VectorMatrixCache:
     """
-    In-memory dense vector matrix cache (v3.0).
-    Eliminates redundant SQLite BLOB reads and numpy buffer deserialization on every query.
-    Auto-invalidates when chunk count or max ID changes.
+    Thread-safe in-memory dense vector matrix cache.
+    Eliminates redundant SQLite BLOB reads across queries while validating BLOB sizes
+    and detecting schema/content mutations.
     """
     def __init__(self):
         self._lock = threading.Lock()
@@ -40,18 +40,29 @@ class VectorMatrixCache:
 
     def get_or_load(self, conn: sqlite3.Connection, db_key: str, dim: int) -> Dict[str, Any]:
         cur = conn.cursor()
-        sig_row = cur.execute("SELECT count(id), coalesce(max(id), 0) FROM chunks;").fetchone()
-        sig = (sig_row[0], sig_row[1]) if sig_row else (0, 0)
+        sig_row = cur.execute(
+            "SELECT count(id), coalesce(max(id), 0), coalesce(sum(length(content)), 0) FROM chunks;"
+        ).fetchone()
+        sig = (sig_row[0], sig_row[1], sig_row[2], dim) if sig_row else (0, 0, 0, dim)
 
         with self._lock:
             cached = self._cache.get(db_key)
             if cached and cached["sig"] == sig:
                 return cached
 
-            # Rebuild cache
-            cur.execute("SELECT id, department_id, embedding FROM chunks ORDER BY id ASC;")
-            rows = cur.fetchall()
-            if not rows:
+            rows = cur.execute("SELECT id, department_id, embedding FROM chunks ORDER BY id ASC;").fetchall()
+            expected_bytes = dim * 4
+            valid_ids = []
+            valid_depts = []
+            valid_blobs = []
+            for r in rows:
+                blob = r["embedding"]
+                if blob and len(blob) == expected_bytes:
+                    valid_ids.append(r["id"])
+                    valid_depts.append(r["department_id"])
+                    valid_blobs.append(blob)
+
+            if not valid_ids:
                 empty = {
                     "sig": sig,
                     "ids": np.array([], dtype=np.int64),
@@ -61,24 +72,19 @@ class VectorMatrixCache:
                 self._cache[db_key] = empty
                 return empty
 
-            chunk_ids = np.array([r["id"] for r in rows], dtype=np.int64)
-            dept_ids = [r["department_id"] for r in rows]
-            blobs = [r["embedding"] for r in rows]
-            matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(-1, dim)
-
             data = {
                 "sig": sig,
-                "ids": chunk_ids,
-                "departments": dept_ids,
-                "matrix": matrix
+                "ids": np.array(valid_ids, dtype=np.int64),
+                "departments": valid_depts,
+                "matrix": np.frombuffer(b"".join(valid_blobs), dtype=np.float32).reshape(-1, dim)
             }
             self._cache[db_key] = data
             return data
 
-    def invalidate(self, db_key: Optional[str] = None):
+    def invalidate(self, db_key: Optional[str] = None) -> None:
         with self._lock:
             if db_key:
-                self._cache.pop(db_key, None)
+                self._cache.pop(str(db_key), None)
             else:
                 self._cache.clear()
 
@@ -91,29 +97,38 @@ class HybridRetriever:
         self.db_path = db_path
         self.embedder = get_embedding_engine()
 
-    def invalidate_cache(self):
+    def invalidate_cache(self) -> None:
         GLOBAL_VECTOR_CACHE.invalidate(str(self.db_path))
 
     def _clean_fts_query(self, query: str) -> str:
         """
         Cleans a natural language Spanish query for SQLite FTS5.
-        Strips accents, punctuation, removes Spanish stopwords, and applies prefix wildcards.
+        Strips accents, punctuation, removes Spanish stopwords, preserves numbers
+        and 2-char domain terms (xG, xA, DT, AT, PF), and applies prefix wildcards.
         """
         no_accents = _strip_accents(query.lower())
         cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in no_accents)
-        raw_words = [w for w in cleaned.split() if len(w) >= 2 or w.isdigit()]
+        raw_words = [
+            w for w in cleaned.split()
+            if len(w) > 2 or w.isdigit() or w in ALLOWED_SHORT_TERMS
+        ]
         if not raw_words:
             return ""
 
         # Filter out Spanish stopwords so BM25 focuses strictly on domain terms and numbers
-        meaningful_words = [
-            w for w in raw_words
-            if (len(w) > 2 or w.isdigit()) and w not in SPANISH_STOPWORDS
-        ]
+        meaningful_words = [w for w in raw_words if w not in SPANISH_STOPWORDS]
         if not meaningful_words:
-            meaningful_words = raw_words
+            return ""
 
-        fts_terms = [f'"{w}"*' for w in meaningful_words]
+        # Deduplicate while preserving order
+        seen = set()
+        unique_words = []
+        for w in meaningful_words:
+            if w not in seen:
+                seen.add(w)
+                unique_words.append(w)
+
+        fts_terms = [f'"{w}"*' for w in unique_words]
         return " OR ".join(fts_terms)
 
     def search_lexical(
@@ -125,6 +140,7 @@ class HybridRetriever:
     ) -> List[Dict[str, Any]]:
         """
         Performs full-text search with BM25 ranking on chunks_fts using direct rowid join.
+        Column weights: chunk_id(0.0), title(1.4), department_id(0.4), content(1.0), tags(0.7).
         """
         fts_q = self._clean_fts_query(query)
         if not fts_q:
@@ -141,7 +157,7 @@ class HybridRetriever:
                         c.department_id,
                         c.content,
                         c.metadata_json,
-                        bm25(chunks_fts) as bm25_rank,
+                        bm25(chunks_fts, 0.0, 1.4, 0.4, 1.0, 0.7) as bm25_rank,
                         snippet(chunks_fts, 3, '«', '»', '...', 22) as match_snippet
                     FROM chunks_fts
                     JOIN chunks c ON c.id = chunks_fts.rowid
@@ -159,7 +175,7 @@ class HybridRetriever:
                         c.department_id,
                         c.content,
                         c.metadata_json,
-                        bm25(chunks_fts) as bm25_rank,
+                        bm25(chunks_fts, 0.0, 1.4, 0.4, 1.0, 0.7) as bm25_rank,
                         snippet(chunks_fts, 3, '«', '»', '...', 22) as match_snippet
                     FROM chunks_fts
                     JOIN chunks c ON c.id = chunks_fts.rowid
@@ -186,8 +202,10 @@ class HybridRetriever:
                     "lexical_rank": idx + 1
                 })
             return results
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            if "fts5" in str(e).lower() or "syntax" in str(e).lower():
+                return []
+            raise
 
     def search_vector(
         self,
@@ -197,25 +215,23 @@ class HybridRetriever:
         limit: int = 25
     ) -> List[Dict[str, Any]]:
         """
-        Two-Phase Dense Vector Search with In-Memory Matrix Cache (v3.0):
-        Phase 1: Zero-disk BLAS dot product against cached normalized float32 matrix.
-        Phase 2: Fetch text & metadata ONLY for the winning Top-K IDs from SQLite.
+        Two-Phase Dense Vector Search with In-Memory Matrix Cache:
+        Phase 1: BLAS dot product against cached normalized float32 matrix.
+        Phase 2: Fetch full text/metadata ONLY for the winning `limit` chunk IDs.
         """
         query_vec = self.embedder.embed_text(query)
         dim = len(query_vec)
-        db_key = str(self.db_path)
-        cache_data = GLOBAL_VECTOR_CACHE.get_or_load(conn, db_key, dim)
+        cache_data = GLOBAL_VECTOR_CACHE.get_or_load(conn, str(self.db_path), dim)
 
         if len(cache_data["ids"]) == 0:
             return []
 
         if department_filter:
-            mask = [d == department_filter for d in cache_data["departments"]]
-            if not any(mask):
+            mask = np.array([d == department_filter for d in cache_data["departments"]], dtype=bool)
+            if not np.any(mask):
                 return []
-            sub_indices = np.where(mask)[0]
-            sub_matrix = cache_data["matrix"][sub_indices]
-            sub_ids = cache_data["ids"][sub_indices]
+            sub_matrix = cache_data["matrix"][mask]
+            sub_ids = cache_data["ids"][mask]
             similarities = self.embedder.compute_cosine_similarity(query_vec, sub_matrix)
             top_sub_idx = np.argsort(similarities)[::-1][:limit]
             winning_ids = [int(sub_ids[i]) for i in top_sub_idx]
@@ -267,49 +283,37 @@ class HybridRetriever:
         """
         Performs hybrid retrieval using Reciprocal Rank Fusion (RRF):
         RRF(d) = alpha * (1 / (K + rank_lexical)) + (1 - alpha) * (1 / (K + rank_vector))
+        When alpha == 1.0, runs pure BM25 lexical search; when alpha == 0.0, runs pure dense vector search.
         """
         start_time = time.perf_counter()
+        alpha = max(0.0, min(1.0, float(alpha)))
+        top_k = max(1, int(top_k))
+        candidate_limit = max(25, top_k * 3)
+
+        run_lexical = alpha > 0.0
+        run_vector = alpha < 1.0
+
         conn = get_db_connection(self.db_path)
         try:
-            lexical_candidates = self.search_lexical(conn, query, department_filter, limit=25)
-            vector_candidates = self.search_vector(conn, query, department_filter, limit=25)
+            lexical_candidates = (
+                self.search_lexical(conn, query, department_filter, limit=candidate_limit)
+                if run_lexical else []
+            )
+            vector_candidates = (
+                self.search_vector(conn, query, department_filter, limit=candidate_limit)
+                if run_vector else []
+            )
         finally:
             conn.close()
 
         fused_scores: Dict[int, Dict[str, Any]] = {}
         K = RRF_K_CONSTANT
 
-        for item in lexical_candidates:
-            cid = item["chunk_id"]
-            rank = item["lexical_rank"]
-            rrf_val = alpha * (1.0 / (K + rank))
-            fused_scores[cid] = {
-                "chunk_id": cid,
-                "document_id": item["document_id"],
-                "title": item["title"],
-                "department_id": item["department_id"],
-                "content": item["content"],
-                "metadata": item["metadata"],
-                "match_snippet": item.get("match_snippet", ""),
-                "bm25_score": item["bm25_score"],
-                "lexical_rank": rank,
-                "vector_rank": None,
-                "cosine_sim": 0.0,
-                "rrf_score": rrf_val,
-                "modalities": ["lexical"]
-            }
-
-        for item in vector_candidates:
-            cid = item["chunk_id"]
-            rank = item["vector_rank"]
-            vector_rrf = (1.0 - alpha) * (1.0 / (K + rank))
-
-            if cid in fused_scores:
-                fused_scores[cid]["rrf_score"] += vector_rrf
-                fused_scores[cid]["vector_rank"] = rank
-                fused_scores[cid]["cosine_sim"] = item["cosine_sim"]
-                fused_scores[cid]["modalities"].append("dense_vector")
-            else:
+        if run_lexical:
+            for item in lexical_candidates:
+                cid = item["chunk_id"]
+                rank = item["lexical_rank"]
+                rrf_val = alpha * (1.0 / (K + rank))
                 fused_scores[cid] = {
                     "chunk_id": cid,
                     "document_id": item["document_id"],
@@ -317,14 +321,42 @@ class HybridRetriever:
                     "department_id": item["department_id"],
                     "content": item["content"],
                     "metadata": item["metadata"],
-                    "match_snippet": "",
-                    "bm25_score": 0.0,
-                    "lexical_rank": None,
-                    "vector_rank": rank,
-                    "cosine_sim": item["cosine_sim"],
-                    "rrf_score": vector_rrf,
-                    "modalities": ["dense_vector"]
+                    "match_snippet": item.get("match_snippet", ""),
+                    "bm25_score": item["bm25_score"],
+                    "lexical_rank": rank,
+                    "vector_rank": None,
+                    "cosine_sim": 0.0,
+                    "rrf_score": rrf_val,
+                    "modalities": ["lexical"]
                 }
+
+        if run_vector:
+            for item in vector_candidates:
+                cid = item["chunk_id"]
+                rank = item["vector_rank"]
+                vector_rrf = (1.0 - alpha) * (1.0 / (K + rank))
+
+                if cid in fused_scores:
+                    fused_scores[cid]["rrf_score"] += vector_rrf
+                    fused_scores[cid]["vector_rank"] = rank
+                    fused_scores[cid]["cosine_sim"] = item["cosine_sim"]
+                    fused_scores[cid]["modalities"].append("dense_vector")
+                else:
+                    fused_scores[cid] = {
+                        "chunk_id": cid,
+                        "document_id": item["document_id"],
+                        "title": item["title"],
+                        "department_id": item["department_id"],
+                        "content": item["content"],
+                        "metadata": item["metadata"],
+                        "match_snippet": "",
+                        "bm25_score": 0.0,
+                        "lexical_rank": None,
+                        "vector_rank": rank,
+                        "cosine_sim": item["cosine_sim"],
+                        "rrf_score": vector_rrf,
+                        "modalities": ["dense_vector"]
+                    }
 
         sorted_chunks = sorted(fused_scores.values(), key=lambda x: x["rrf_score"], reverse=True)
         top_results = sorted_chunks[:top_k]
@@ -340,3 +372,4 @@ class HybridRetriever:
             "retrieval_ms": round(duration_ms, 2),
             "results": top_results
         }
+

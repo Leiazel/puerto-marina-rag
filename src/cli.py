@@ -1,5 +1,5 @@
 """
-Interactive CLI for Club Atlético Puerto Marina RAG System.
+Interactive CLI for Club Atlético Puerto Marina RAG System (v2.2).
 Allows instant queries, interactive terminal sessions, stats inspection, and re-indexing.
 """
 import sys
@@ -11,8 +11,25 @@ root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
+from src.config import DB_PATH
 from src.rag_pipeline import ClubRAGPipeline
 from src.ingestion import run_full_ingestion
+
+DEPT_PREFIX_MAP = {
+    "medico": "servicio_medico",
+    "servicio_medico": "servicio_medico",
+    "gps": "preparacion_fisica",
+    "preparacion_fisica": "preparacion_fisica",
+    "tactica": "cuerpo_tecnico",
+    "cuerpo_tecnico": "cuerpo_tecnico",
+    "nutricion": "nutricion",
+    "scouting": "scouting",
+    "logistica": "logistica_viajes",
+    "logistica_viajes": "logistica_viajes",
+    "prensa": "disciplina_prensa",
+    "disciplina_prensa": "disciplina_prensa",
+}
+VALID_DEPARTMENTS = set(DEPT_PREFIX_MAP.values())
 
 
 def print_banner():
@@ -27,6 +44,9 @@ def display_result(result):
     print(f"🔎 CONSULTA: {result['query']}")
     if result.get("department_filter"):
         print(f"🏢 FILTRO ÁREA: {result['department_filter']}")
+    print(f"🧠 MOTOR: {result.get('model_used', 'local')} | 🎯 CONFIANZA: {int(result.get('confidence', 0) * 100)}%")
+    if result.get("fallback_used"):
+        print(f"⚠️  FALLBACK ACTIVO: {result.get('fallback_reason')}")
     print(f"⏱️  TIEMPO TOTAL: {result['timings']['total_ms']} ms "
           f"(Búsqueda: {result['timings']['retrieval_ms']} ms | Síntesis: {result['timings']['generation_ms']} ms)")
     print("=" * 70 + "\n")
@@ -46,15 +66,21 @@ def display_result(result):
     print("=" * 70 + "\n")
 
 
+def _ensure_db_initialized():
+    if not DB_PATH.exists():
+        print("⚙️  Base de datos no encontrada. Ejecutando ingesta inicial...")
+        run_full_ingestion()
+
+
 def interactive_mode(pipeline):
     print_banner()
     print("Modo interactivo iniciado. Escribe tu pregunta (o 'salir' para terminar):")
     print("Ejemplos:")
     print("  - ¿Cuál es la evolución de la lesión de Lautaro Carrizo y cuándo puede jugar?")
     print("  - ¿Qué jugador tiene riesgo de sobrecarga según el reporte de GPS Catapult?")
-    print("  - ¿Quién es celíaco y qué menú especial requiere en el hotel?")
-    print("  - ¿Cuáles son las multas por llegar tarde al entrenamiento o por sobrepeso?")
-    print("  - ¿Cuál es el análisis táctico y las debilidades del rival Deportivo Los Andes?")
+    print("  - nutricion: ¿Quién es celíaco y qué menú especial requiere en el hotel?")
+    print("  - logistica: ¿En qué hotel se concentra el plantel?")
+    print("  - prensa: ¿Cuáles son las multas por llegar tarde al entrenamiento?")
     print("-" * 70)
 
     while True:
@@ -65,20 +91,18 @@ def interactive_mode(pipeline):
             if q.lower() in ["salir", "exit", "quit", "q"]:
                 print("Cerrando sesión. ¡Vamos Puerto Marina!")
                 break
-            
+
             # Check for department filter syntax: e.g. "medico: ¿como esta carrizo?"
             dept_filter = None
-            if ":" in q and q.split(":", 1)[0].lower() in ["medico", "servicio_medico", "gps", "preparacion_fisica", "tactica", "cuerpo_tecnico", "nutricion", "scouting", "logistica", "prensa"]:
-                tag, actual_q = q.split(":", 1)
-                mapping = {
-                    "medico": "servicio_medico", "servicio_medico": "servicio_medico",
-                    "gps": "preparacion_fisica", "preparacion_fisica": "preparacion_fisica",
-                    "tactica": "cuerpo_tecnico", "cuerpo_tecnico": "cuerpo_tecnico",
-                    "nutricion": "nutricion", "scouting": "scouting",
-                    "logistica": "logistica_viajes", "prensa": "disciplina_prensa"
-                }
-                dept_filter = mapping.get(tag.strip().lower())
-                q = actual_q.strip()
+            if ":" in q:
+                prefix, rest = q.split(":", 1)
+                mapped = DEPT_PREFIX_MAP.get(prefix.strip().lower())
+                if mapped:
+                    dept_filter = mapped
+                    q = rest.strip()
+                    if not q:
+                        print("⚠️  Escribe una consulta después del prefijo de departamento.")
+                        continue
 
             result = pipeline.ask(q, department_filter=dept_filter)
             display_result(result)
@@ -91,25 +115,34 @@ def main():
     parser = argparse.ArgumentParser(description="CLI de RAG para Club Atlético Puerto Marina")
     parser.add_argument("--query", "-q", type=str, help="Ejecutar una consulta directa")
     parser.add_argument("--dept", "-d", type=str, default=None, help="Filtrar por departamento (ej: servicio_medico, cuerpo_tecnico)")
-    parser.add_argument("--top_k", "-k", type=int, default=4, help="Número de fragmentos a recuperar (default: 4)")
+    parser.add_argument("--top_k", "-k", type=int, default=4, help="Número de fragmentos a recuperar (1-15, default: 4)")
     parser.add_argument("--alpha", "-a", type=float, default=0.5, help="Peso híbrido RRF: 0=vector, 1=lexical (default: 0.5)")
     parser.add_argument("--interactive", "-i", action="store_true", help="Iniciar sesión interactiva")
     parser.add_argument("--stats", "-s", action="store_true", help="Mostrar estadísticas de la base de datos")
     parser.add_argument("--reindex", "-r", action="store_true", help="Reindexar todos los documentos de la carpeta data")
-    parser.add_argument("--upload", "-u", nargs="+", help="Cargar e indexar uno o múltiples archivos (PDF, DOCX, DOC, MD, TXT)")
-    parser.add_argument("--author", type=str, default="Staff Técnico", help="Autor de los archivos a subir (default: Staff Técnico)")
-    parser.add_argument("--tags", type=str, default="", help="Etiquetas separadas por comas para los archivos a subir")
+    parser.add_argument("--upload", "-u", nargs="+", help="Subir e indexar uno o más archivos (PDF, DOCX, DOC, MD, TXT)")
+    parser.add_argument("--author", type=str, default="Staff Técnico", help="Autor del documento subido")
+    parser.add_argument("--tags", type=str, default="", help="Etiquetas para documentos subidos (separadas por coma)")
 
     args = parser.parse_args()
+
+    if not (0.0 <= args.alpha <= 1.0):
+        parser.error("--alpha debe estar entre 0.0 y 1.0")
+    if not (1 <= args.top_k <= 15):
+        parser.error("--top_k debe estar entre 1 y 15")
+    if args.dept and args.dept not in VALID_DEPARTMENTS:
+        parser.error(f"--dept inválido '{args.dept}'. Opciones: {', '.join(sorted(VALID_DEPARTMENTS))}")
 
     if args.reindex:
         print_banner()
         run_full_ingestion()
         return
 
+    _ensure_db_initialized()
+
     if args.upload:
         print_banner()
-        from src.config import DB_PATH, UPLOADS_DIR
+        from src.config import UPLOADS_DIR, ALLOWED_UPLOAD_EXTENSIONS, MAX_UPLOAD_SIZE_BYTES
         from src.database import get_db_connection
         from src.embeddings import get_embedding_engine
         from src.ingestion import ingest_uploaded_file
@@ -118,32 +151,46 @@ def main():
         print(f"📤 Iniciando subida de {len(args.upload)} archivo(s) al departamento '{dept_id}'...")
         conn = get_db_connection(DB_PATH)
         embedder = get_embedding_engine()
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        dest_dir = UPLOADS_DIR / dept_id
+        uploads_root = UPLOADS_DIR.resolve()
+        dest_dir = (uploads_root / dept_id).resolve()
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        for file_str in args.upload:
-            file_path = Path(file_str)
-            if not file_path.exists():
-                print(f"❌ Archivo no encontrado: {file_str}")
-                continue
-            try:
-                dest_file = dest_dir / file_path.name
-                dest_file.write_bytes(file_path.read_bytes())
-                doc_id, count, doc_code = ingest_uploaded_file(
-                    file_path=dest_file,
-                    original_filename=file_path.name,
-                    department_id=dept_id,
-                    author=args.author,
-                    tags=args.tags,
-                    conn=conn,
-                    embedder=embedder
-                )
-                print(f"✅ [{file_path.name}] -> Código {doc_code} (Doc ID {doc_id}: {count} chunks indexados)")
-            except Exception as e:
-                print(f"❌ Error al procesar {file_path.name}: {e}")
+        try:
+            for file_str in args.upload:
+                file_path = Path(file_str)
+                if not file_path.exists() or not file_path.is_file():
+                    print(f"❌ Archivo no encontrado: {file_str}")
+                    continue
+                if file_path.suffix.lower() not in ALLOWED_UPLOAD_EXTENSIONS:
+                    print(f"❌ Extensión no soportada '{file_path.suffix}' en {file_path.name}")
+                    continue
+                raw_bytes = file_path.read_bytes()
+                if len(raw_bytes) == 0 or len(raw_bytes) > MAX_UPLOAD_SIZE_BYTES:
+                    print(f"❌ Tamaño inválido en {file_path.name} ({len(raw_bytes)} bytes)")
+                    continue
+                try:
+                    safe_name = file_path.name
+                    dest_file = (dest_dir / safe_name).resolve()
+                    if not dest_file.is_relative_to(dest_dir):
+                        print(f"❌ Ruta de destino inválida para {file_path.name}")
+                        continue
+                    doc_id, count, doc_code = ingest_uploaded_file(
+                        file_path=dest_file,
+                        original_filename=file_path.name,
+                        department_id=dept_id,
+                        author=args.author,
+                        tags=args.tags,
+                        conn=conn,
+                        embedder=embedder,
+                        file_bytes=raw_bytes,
+                        write_to_disk=True
+                    )
+                    print(f"✅ [{file_path.name}] -> Código {doc_code} (Doc ID {doc_id}: {count} chunks indexados)")
+                except Exception as e:
+                    print(f"❌ Error al procesar {file_path.name}: {e}")
+        finally:
+            conn.close()
 
-        conn.close()
         print("\n✨ Proceso de carga y sincronización completado.")
         return
 
@@ -153,6 +200,7 @@ def main():
         print_banner()
         stats = pipeline.get_stats()
         print("\n📊 ESTADÍSTICAS DEL SISTEMA:")
+        print(f" - Motor de síntesis activo:        {stats['synthesis_mode']}")
         print(f" - Documentos operativos indexados: {stats['documents_count']}")
         print(f" - Fragmentos (chunks) en SQLite:   {stats['chunks_count']}")
         print(f" - Futbolistas registrados:         {stats['players_count']}")
@@ -166,8 +214,10 @@ def main():
         print("=" * 70)
         return
 
-    if args.query:
-        result = pipeline.ask(args.query, department_filter=args.dept, top_k=args.top_k, alpha=args.alpha)
+    if args.query is not None:
+        if not args.query.strip():
+            parser.error("--query no puede estar vacío")
+        result = pipeline.ask(args.query.strip(), department_filter=args.dept, top_k=args.top_k, alpha=args.alpha)
         display_result(result)
         return
 
@@ -177,3 +227,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

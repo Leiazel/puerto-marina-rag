@@ -1,16 +1,13 @@
 """
 FastAPI REST API server for Club Atlético Puerto Marina RAG System (v3.0).
-Features:
-- Hybrid RAG queries (SQLite FTS5 BM25 + FastEmbed Multilingual ONNX + RRF).
-- Hardened Path Traversal protection on file writes and department validation.
-- Multi-format document upload (PDF, DOCX, DOC, MD, TXT) with SHA-256 deduplication and magic byte validation.
-- Cascading document deletion and real-time in-memory vector cache invalidation.
-- Telemetry, relational SQL entity inspection, and LLM diagnostics.
 """
 import re
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+import yaml
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -18,86 +15,102 @@ from pydantic import BaseModel, Field
 
 from src.config import (
     BASE_DIR,
-    DB_PATH,
+    RAW_DOCS_DIR,
     UPLOADS_DIR,
-    ALLOWED_EXTENSIONS,
-    MAX_UPLOAD_SIZE_BYTES
+    DB_PATH,
+    CORS_ALLOW_ORIGINS,
+    MAX_UPLOAD_SIZE_BYTES,
+    ALLOWED_UPLOAD_EXTENSIONS,
 )
-from src.database import get_db_connection
+from src.database import get_db_connection, init_database
 from src.rag_pipeline import ClubRAGPipeline
 from src.ingestion import (
     ingest_document_file,
     ingest_uploaded_file,
     run_full_ingestion,
-    INITIAL_DEPARTMENTS
+    delete_document_by_id,
+    seed_metadata,
 )
 from src.embeddings import get_embedding_engine
 from src.extractors import ExtractionError
 
+_DOC_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{3,80}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_reindex_lock = threading.Lock()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db_path = pipeline.db_path
+    init_database(db_path)
+    conn = get_db_connection(db_path)
+    try:
+        dept_count = conn.execute("SELECT count(*) FROM departments").fetchone()[0]
+        if dept_count == 0:
+            seed_metadata(conn)
+    finally:
+        conn.close()
+    yield
+
+
 app = FastAPI(
     title="Club Atlético Puerto Marina - RAG Knowledge Engine v3.0",
     description="Hybrid RAG system (SQLite FTS5 BM25 + FastEmbed ONNX + RRF) with multi-format ingestion for football club operations.",
-    version="3.0.0"
+    version="3.0.0",
+    lifespan=lifespan
 )
 
-# Hardened CORS policy: avoid allow_credentials=True with wildcard allow_origins
+allow_all_origins = "*" in CORS_ALLOW_ORIGINS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=not allow_all_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 pipeline = ClubRAGPipeline(db_path=DB_PATH)
 STATIC_DIR = BASE_DIR / "web" / "static"
-VALID_DEPT_IDS = {d["id"] for d in INITIAL_DEPARTMENTS}
-
-
-def validate_department_id(dept_id: str) -> str:
-    """Ensures department ID is whitelisted and prevents directory traversal."""
-    clean = dept_id.strip().lower()
-    if clean not in VALID_DEPT_IDS:
-        conn = get_db_connection(DB_PATH)
-        row = conn.execute("SELECT id FROM departments WHERE id = ?", (clean,)).fetchone()
-        conn.close()
-        if not row:
-            raise HTTPException(status_code=400, detail=f"Departamento inválido: '{dept_id}'.")
-    return clean
-
-
-def sanitize_doc_code(code: str) -> str:
-    """Sanitizes document identifier preventing directory traversal or path separators."""
-    clean = re.sub(r'[^a-zA-Z0-9_-]', '', code.strip())
-    if not clean or len(clean) < 3:
-        raise HTTPException(status_code=400, detail="Código de documento inválido o demasiado corto.")
-    return clean
-
-
-def sanitize_filename(filename: str) -> str:
-    """Returns a safe basename without path separators or dangerous characters."""
-    base = Path(filename).name
-    clean = re.sub(r'[^a-zA-Z0-9_.-]', '_', base)
-    if not clean or clean.startswith("."):
-        clean = f"documento_{clean}"
-    return clean
 
 
 class QueryRequest(BaseModel):
-    query: str = Field(..., description="Pregunta en lenguaje natural sobre el club o día a día")
+    query: str = Field(..., min_length=1, max_length=2000, description="Pregunta en lenguaje natural sobre el club o día a día")
     department_filter: Optional[str] = Field(None, description="Filtro opcional por departamento")
     top_k: int = Field(4, ge=1, le=15, description="Cantidad de fragmentos a recuperar")
     alpha: float = Field(0.5, ge=0.0, le=1.0, description="Balance Híbrido: 1.0 = BM25, 0.0 = Vector, 0.5 = RRF")
 
 
 class IngestDocRequest(BaseModel):
-    doc_code: str = Field(..., description="Código único del documento (ej: MED-2026-11-08-01)")
-    title: str = Field(..., description="Título oficial del documento")
-    department_id: str = Field(..., description="ID del departamento responsable")
-    author: str = Field("Staff Técnico", description="Autor o profesional emisor")
+    doc_code: str = Field(..., min_length=3, max_length=80, description="Código único del documento (ej: MED-2026-11-08-01)")
+    title: str = Field(..., min_length=1, max_length=250, description="Título oficial del documento")
+    department_id: str = Field(..., min_length=1, max_length=64, description="ID del departamento responsable")
+    author: str = Field("Staff Técnico", min_length=1, max_length=120, description="Autor o profesional emisor")
     date: str = Field("2026-11-08", description="Fecha en formato YYYY-MM-DD")
     tags: List[str] = Field(default=[], description="Etiquetas clave")
-    content: str = Field(..., description="Contenido en formato Markdown con secciones")
+    content: str = Field(..., min_length=1, max_length=100000, description="Contenido en formato Markdown con secciones")
+
+
+def _validate_department_exists(conn, department_id: str) -> None:
+    row = conn.execute("SELECT id FROM departments WHERE id = ?", (department_id,)).fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Departamento '{department_id}' no válido."
+        )
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Returns a safe basename without path separators or hidden dotfiles."""
+    base = Path(filename or "documento").name
+    clean = re.sub(r'[^a-zA-Z0-9_.-]', '_', base)
+    if not clean or clean.startswith("."):
+        clean = f"documento_{clean.lstrip('.') or 'archivo'}"
+    return clean
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 
 @app.get("/api/status")
@@ -106,7 +119,6 @@ def get_status():
     return {
         "status": "online",
         "club": "Club Atlético Puerto Marina",
-        "version": "3.0.0",
         "stats": stats
     }
 
@@ -119,11 +131,21 @@ def get_llm_health():
 
 @app.post("/api/query")
 def run_query(req: QueryRequest):
-    if not req.query.strip():
+    clean_query = req.query.strip()
+    if not clean_query:
         raise HTTPException(status_code=400, detail="La consulta no puede estar vacía.")
+
+    dept_filter = req.department_filter.strip() if req.department_filter else None
+    if dept_filter:
+        conn = get_db_connection(pipeline.db_path)
+        try:
+            _validate_department_exists(conn, dept_filter)
+        finally:
+            conn.close()
+
     return pipeline.ask(
-        query=req.query,
-        department_filter=req.department_filter,
+        query=clean_query,
+        department_filter=dept_filter,
         top_k=req.top_k,
         alpha=req.alpha
     )
@@ -131,116 +153,140 @@ def run_query(req: QueryRequest):
 
 @app.post("/api/reindex")
 def reindex_knowledge_base():
-    """Re-runs full ingestion of Markdown files and SQL relational tables."""
-    res = run_full_ingestion(DB_PATH)
-    pipeline.invalidate_cache()
-    return {"status": "reindexed", "details": res}
+    """Re-runs full ingestion of Markdown files, uploaded files, and SQL relational tables."""
+    if not _reindex_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Ya hay una reindexación en progreso.")
+    try:
+        res = run_full_ingestion(
+            db_path=pipeline.db_path,
+            docs_dir=RAW_DOCS_DIR,
+            uploads_dir=UPLOADS_DIR,
+        )
+        pipeline.invalidate_cache()
+        return {"status": "reindexed", "details": res}
+    finally:
+        _reindex_lock.release()
 
 
 @app.get("/api/documents")
 def list_documents(department: Optional[str] = None):
-    conn = get_db_connection(DB_PATH)
-    cur = conn.cursor()
-    if department:
-        cur.execute("""
-            SELECT d.*, dept.name as department_name, count(c.id) as chunk_count
-            FROM documents d
-            JOIN departments dept ON dept.id = d.department_id
-            LEFT JOIN chunks c ON c.document_id = d.id
-            WHERE d.department_id = ?
-            GROUP BY d.id
-            ORDER BY d.created_at DESC;
-        """, (department,))
-    else:
-        cur.execute("""
-            SELECT d.*, dept.name as department_name, count(c.id) as chunk_count
-            FROM documents d
-            JOIN departments dept ON dept.id = d.department_id
-            LEFT JOIN chunks c ON c.document_id = d.id
-            GROUP BY d.id
-            ORDER BY d.created_at DESC;
-        """)
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        cur = conn.cursor()
+        if department:
+            cur.execute("""
+                SELECT d.*, dept.name as department_name, count(c.id) as chunk_count
+                FROM documents d
+                JOIN departments dept ON dept.id = d.department_id
+                LEFT JOIN chunks c ON c.document_id = d.id
+                WHERE d.department_id = ?
+                GROUP BY d.id
+                ORDER BY d.date DESC, d.id DESC;
+            """, (department,))
+        else:
+            cur.execute("""
+                SELECT d.*, dept.name as department_name, count(c.id) as chunk_count
+                FROM documents d
+                JOIN departments dept ON dept.id = d.department_id
+                LEFT JOIN chunks c ON c.document_id = d.id
+                GROUP BY d.id
+                ORDER BY d.date DESC, d.id DESC;
+            """)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 @app.get("/api/documents/{doc_id}")
 def get_document(doc_id: int):
-    conn = get_db_connection(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
-    doc = cur.fetchone()
-    if not doc:
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+        doc = cur.fetchone()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Documento no encontrado.")
+
+        cur.execute(
+            "SELECT id, chunk_index, title, content, metadata_json FROM chunks WHERE document_id = ? ORDER BY chunk_index ASC",
+            (doc_id,)
+        )
+        chunks = cur.fetchall()
+        return {"document": dict(doc), "chunks": [dict(c) for c in chunks]}
+    finally:
         conn.close()
-        raise HTTPException(status_code=404, detail="Documento no encontrado.")
-
-    cur.execute(
-        "SELECT id, chunk_index, title, department_id, content, metadata_json FROM chunks WHERE document_id = ? ORDER BY chunk_index ASC",
-        (doc_id,)
-    )
-    chunks = cur.fetchall()
-    conn.close()
-    return {"document": dict(doc), "chunks": [dict(c) for c in chunks]}
-
-
-@app.delete("/api/documents/{doc_id}")
-def remove_document(doc_id: int):
-    """Deletes a document and all associated chunks from SQLite and FTS5."""
-    ok = pipeline.delete_document(doc_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Documento no encontrado.")
-    return {
-        "status": "deleted",
-        "document_id": doc_id,
-        "message": f"Documento #{doc_id} y sus fragmentos fueron eliminados exitosamente."
-    }
 
 
 @app.post("/api/documents")
 def add_new_document(req: IngestDocRequest):
-    """Ingests a new Markdown document with strict path traversal prevention."""
-    dept_id = validate_department_id(req.department_id)
-    safe_code = sanitize_doc_code(req.doc_code)
+    doc_code = req.doc_code.strip()
+    if not _DOC_CODE_RE.match(doc_code):
+        raise HTTPException(
+            status_code=400,
+            detail="doc_code inválido: solo se permiten letras, números, '-' y '_' (3 a 80 caracteres)."
+        )
+    if not _DATE_RE.match(req.date.strip()):
+        raise HTTPException(status_code=400, detail="Fecha inválida: use formato YYYY-MM-DD.")
 
-    raw_md = (
-        f"---\n"
-        f"id: {safe_code}\n"
-        f"title: {req.title.strip()}\n"
-        f"department: {dept_id}\n"
-        f"author: {req.author.strip()}\n"
-        f"date: {req.date.strip()}\n"
-        f"tags: [{', '.join(t.strip() for t in req.tags if t.strip())}]\n"
-        f"---\n\n"
-        f"{req.content.strip()}\n"
-    )
+    department_id = req.department_id.strip()
+    title = req.title.strip()
+    author = req.author.strip()
+    content = req.content.strip()
+    if not title or not author or not content:
+        raise HTTPException(status_code=400, detail="Título, autor y contenido no pueden estar vacíos.")
 
-    base_raw = (BASE_DIR / "data" / "raw_documents").resolve()
-    dept_folder = (base_raw / dept_id).resolve()
-    if not str(dept_folder).startswith(str(base_raw)):
-        raise HTTPException(status_code=400, detail="Intento de navegación de ruta no autorizada.")
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        _validate_department_exists(conn, department_id)
 
-    dept_folder.mkdir(parents=True, exist_ok=True)
-    target_file = (dept_folder / f"{safe_code}.md").resolve()
-    if not str(target_file).startswith(str(dept_folder)):
-        raise HTTPException(status_code=400, detail="Ruta de destino inválida.")
+        raw_docs_root = RAW_DOCS_DIR.resolve()
+        dept_folder = (raw_docs_root / department_id).resolve()
+        if not dept_folder.is_relative_to(raw_docs_root):
+            raise HTTPException(status_code=400, detail="Ruta de departamento inválida.")
+        dept_folder.mkdir(parents=True, exist_ok=True)
 
-    target_file.write_text(raw_md, encoding="utf-8")
+        target_file = (dept_folder / f"{doc_code}.md").resolve()
+        if not target_file.is_relative_to(dept_folder):
+            raise HTTPException(status_code=400, detail="Ruta de archivo inválida.")
 
-    conn = get_db_connection(DB_PATH)
-    embedder = get_embedding_engine()
-    doc_id, chunk_count = ingest_document_file(target_file, conn, embedder)
-    conn.close()
+        # Clean previous file if same doc_code existed under another department folder
+        prev = conn.execute("SELECT file_path FROM documents WHERE doc_code = ?", (doc_code,)).fetchone()
+        if prev and prev["file_path"] and not str(prev["file_path"]).startswith("sqlite://"):
+            prev_path = Path(prev["file_path"])
+            if not prev_path.is_absolute():
+                prev_path = (BASE_DIR / prev_path).resolve()
+            else:
+                prev_path = prev_path.resolve()
+            if prev_path != target_file and prev_path.is_relative_to(raw_docs_root) and prev_path.exists():
+                prev_path.unlink()
 
-    pipeline.invalidate_cache()
+        clean_tags = [t.strip() for t in req.tags if t and t.strip()]
+        frontmatter = {
+            "id": doc_code,
+            "title": title,
+            "department": department_id,
+            "author": author,
+            "date": req.date.strip(),
+            "tags": clean_tags,
+        }
+        fm_yaml = yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False).strip()
+        raw_md = f"---\n{fm_yaml}\n---\n\n{content}\n"
+        target_file.write_text(raw_md, encoding="utf-8")
 
-    return {
-        "status": "success",
-        "document_id": doc_id,
-        "doc_code": safe_code,
-        "chunks_created": chunk_count,
-        "message": f"Documento '{req.title}' indexado correctamente en la base de datos."
-    }
+        embedder = get_embedding_engine()
+        doc_id, chunk_count = ingest_document_file(target_file, conn, embedder)
+        pipeline.invalidate_cache()
+
+        return {
+            "status": "success",
+            "document_id": doc_id,
+            "doc_code": doc_code,
+            "chunks_created": chunk_count,
+            "message": f"Documento '{title}' indexado correctamente en la base de datos."
+        }
+    finally:
+        conn.close()
 
 
 @app.post("/api/upload")
@@ -251,36 +297,41 @@ async def upload_multiple_documents(
     tags: Optional[str] = Form("")
 ):
     """
-    Multi-format document upload endpoint (v3.0).
-    Accepts PDF, DOCX, DOC, MD, TXT files.
-    Validates magic bytes, size limits, extracts text, performs SHA-256 deduplication,
-    indexes into chunks and FTS5, and invalidates vector cache.
+    Multi-format document upload endpoint (PDF, DOCX, DOC, MD, TXT).
+    Validates extension, size limit, magic bytes, extracts text before writing to disk,
+    performs department-scoped SHA-256 deduplication, indexes into SQLite/FTS5, and updates vector cache.
     """
-    dept_id = validate_department_id(department_id)
     if not files:
         raise HTTPException(status_code=400, detail="No se enviaron archivos para cargar.")
 
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    target_dir = (UPLOADS_DIR / dept_id).resolve()
-    target_dir.mkdir(parents=True, exist_ok=True)
+    dept_id = department_id.strip()
+    clean_author = (author or "Staff Técnico").strip() or "Staff Técnico"
+    clean_tags = (tags or "").strip()
 
+    conn = get_db_connection(pipeline.db_path)
+    embedder = get_embedding_engine()
     results = []
     successful_count = 0
     failed_count = 0
 
-    conn = get_db_connection(DB_PATH)
-    embedder = get_embedding_engine()
-
     try:
+        _validate_department_exists(conn, dept_id)
+
+        uploads_root = UPLOADS_DIR.resolve()
+        target_dir = (uploads_root / dept_id).resolve()
+        if not target_dir.is_relative_to(uploads_root):
+            raise HTTPException(status_code=400, detail="Ruta de departamento inválida.")
+        target_dir.mkdir(parents=True, exist_ok=True)
+
         for file in files:
             original_name = file.filename or "archivo_subido"
             ext = Path(original_name).suffix.lower()
 
-            if ext not in ALLOWED_EXTENSIONS:
+            if ext not in ALLOWED_UPLOAD_EXTENSIONS:
                 results.append({
                     "filename": original_name,
                     "status": "error",
-                    "message": f"Formato no permitido '{ext}'. Formatos soportados: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                    "message": f"Formato no permitido '{ext}'. Formatos soportados: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}"
                 })
                 failed_count += 1
                 continue
@@ -305,27 +356,9 @@ async def upload_multiple_documents(
                 failed_count += 1
                 continue
 
-            # Verify binary magic headers
-            if ext == ".pdf" and not file_bytes.startswith(b"%PDF-"):
-                results.append({
-                    "filename": original_name,
-                    "status": "error",
-                    "message": "Firma binaria corrupta o inválida. No es un documento PDF estándar."
-                })
-                failed_count += 1
-                continue
-            elif ext == ".docx" and not file_bytes.startswith(b"PK\x03\x04"):
-                results.append({
-                    "filename": original_name,
-                    "status": "error",
-                    "message": "Firma binaria inválida. No es un documento DOCX válido."
-                })
-                failed_count += 1
-                continue
-
-            safe_name = sanitize_filename(original_name)
+            safe_name = _sanitize_filename(original_name)
             dest_path = (target_dir / safe_name).resolve()
-            if not str(dest_path).startswith(str(UPLOADS_DIR.resolve())):
+            if not dest_path.is_relative_to(target_dir):
                 results.append({
                     "filename": original_name,
                     "status": "error",
@@ -334,18 +367,17 @@ async def upload_multiple_documents(
                 failed_count += 1
                 continue
 
-            dest_path.write_bytes(file_bytes)
-
             try:
                 doc_id, chunk_count, doc_code = ingest_uploaded_file(
                     file_path=dest_path,
                     original_filename=original_name,
                     department_id=dept_id,
-                    author=author or "Staff Técnico",
-                    tags=tags or "",
+                    author=clean_author,
+                    tags=clean_tags,
                     conn=conn,
                     embedder=embedder,
-                    file_bytes=file_bytes
+                    file_bytes=file_bytes,
+                    write_to_disk=True
                 )
                 results.append({
                     "filename": original_name,
@@ -371,7 +403,6 @@ async def upload_multiple_documents(
                     "message": f"Error al procesar e indexar: {str(e)}"
                 })
                 failed_count += 1
-
     finally:
         conn.close()
 
@@ -386,49 +417,89 @@ async def upload_multiple_documents(
     }
 
 
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: int, delete_file: bool = Query(True)):
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        doc = conn.execute("SELECT id, doc_code, title, file_path FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Documento no encontrado.")
+        if str(doc["file_path"] or "").startswith("sqlite://"):
+            raise HTTPException(
+                status_code=400,
+                detail="No se pueden eliminar documentos virtuales sincronizados desde tablas SQL."
+            )
+
+        deleted = delete_document_by_id(doc_id, conn)
+        pipeline.invalidate_cache()
+
+        if delete_file and deleted and deleted.get("file_path"):
+            raw_docs_root = RAW_DOCS_DIR.resolve()
+            uploads_root = UPLOADS_DIR.resolve()
+            fpath = Path(deleted["file_path"])
+            if not fpath.is_absolute():
+                fpath = (BASE_DIR / fpath).resolve()
+            else:
+                fpath = fpath.resolve()
+            if (fpath.is_relative_to(raw_docs_root) or fpath.is_relative_to(uploads_root)) and fpath.exists():
+                fpath.unlink()
+
+        return {
+            "status": "deleted",
+            "document_id": doc_id,
+            "doc_code": deleted["doc_code"] if deleted else None,
+            "message": f"Documento '{deleted['title']}' eliminado del índice."
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/api/players")
 def list_players():
-    conn = get_db_connection(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM players ORDER BY dorsal ASC;")
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        rows = conn.execute("SELECT * FROM players ORDER BY dorsal ASC;").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 @app.get("/api/staff")
 def list_staff():
-    conn = get_db_connection(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT s.*, d.name as department_name 
-        FROM staff s
-        JOIN departments d ON d.id = s.department_id
-        ORDER BY s.id ASC;
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        rows = conn.execute("""
+            SELECT s.*, d.name as department_name 
+            FROM staff s
+            JOIN departments d ON d.id = s.department_id
+            ORDER BY s.id ASC;
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 @app.get("/api/departments")
 def list_departments():
-    conn = get_db_connection(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM departments ORDER BY id ASC;")
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        rows = conn.execute("SELECT * FROM departments ORDER BY id ASC;").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 @app.get("/api/logs")
-def list_logs(limit: int = 20):
-    conn = get_db_connection(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM query_logs ORDER BY created_at DESC LIMIT ?;", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def list_logs(limit: int = Query(15, ge=1, le=200)):
+    conn = get_db_connection(pipeline.db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM query_logs ORDER BY created_at DESC, id DESC LIMIT ?;",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 if STATIC_DIR.exists():
@@ -439,4 +510,5 @@ if STATIC_DIR.exists():
         index_file = STATIC_DIR / "index.html"
         if index_file.exists():
             return FileResponse(str(index_file))
-        return {"message": "Puerto Marina RAG Engine v3.0 is running."}
+        return {"message": "Puerto Marina RAG Engine v2.2 is running."}
+

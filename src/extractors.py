@@ -17,29 +17,47 @@ class ExtractionError(Exception):
     pass
 
 
+def validate_file_magic_bytes(filename: str, file_bytes: bytes) -> None:
+    """Validates binary signatures for PDF, DOCX, DOC, and ensures text formats contain no null bytes."""
+    ext = Path(filename).suffix.lower()
+    if ext == ".pdf" and not file_bytes.startswith(b"%PDF-"):
+        raise ExtractionError("Firma binaria corrupta o inválida. No es un documento PDF estándar.")
+    if ext == ".docx" and not file_bytes.startswith(b"PK\x03\x04"):
+        raise ExtractionError("Firma binaria inválida. No es un documento DOCX válido (ZIP/OOXML).")
+    if ext == ".doc" and not file_bytes.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+        raise ExtractionError("Firma binaria inválida. No es un documento OLE2 (.doc) válido.")
+    if ext in (".md", ".txt") and b"\x00" in file_bytes[:4096]:
+        raise ExtractionError("El archivo de texto contiene bytes nulos binarios no válidos.")
+
+
 def extract_text_from_pdf(content_or_path: Union[str, Path, bytes]) -> Dict[str, Any]:
     """
     Extracts text from a PDF document page by page, formatting output as structured Markdown.
     Detects scanned PDFs with no extractable text layer.
     """
-    if isinstance(content_or_path, (str, Path)):
-        reader = pypdf.PdfReader(str(content_or_path))
-    else:
-        reader = pypdf.PdfReader(io.BytesIO(content_or_path))
+    try:
+        if isinstance(content_or_path, (str, Path)):
+            reader = pypdf.PdfReader(str(content_or_path))
+        else:
+            reader = pypdf.PdfReader(io.BytesIO(content_or_path))
 
-    total_pages = len(reader.pages)
-    if total_pages == 0:
-        raise ExtractionError("El archivo PDF no contiene páginas.")
+        total_pages = len(reader.pages)
+        if total_pages == 0:
+            raise ExtractionError("El archivo PDF no contiene páginas.")
 
-    extracted_pages = []
-    total_chars = 0
+        extracted_pages = []
+        total_chars = 0
 
-    for page_idx, page in enumerate(reader.pages, 1):
-        page_text = page.extract_text() or ""
-        page_text = page_text.strip()
-        if page_text:
-            extracted_pages.append(f"## Página {page_idx}\n\n{page_text}")
-            total_chars += len(page_text)
+        for page_idx, page in enumerate(reader.pages, 1):
+            page_text = page.extract_text() or ""
+            page_text = page_text.strip()
+            if page_text:
+                extracted_pages.append(f"## Página {page_idx}\n\n{page_text}")
+                total_chars += len(page_text)
+    except ExtractionError:
+        raise
+    except Exception as e:
+        raise ExtractionError(f"Error al procesar el archivo PDF: {e}") from e
 
     if total_chars < 30:
         raise ExtractionError(
@@ -61,10 +79,13 @@ def extract_text_from_docx(content_or_path: Union[str, Path, bytes]) -> Dict[str
     Extracts text and tables from DOCX using python-docx.
     Maps Heading styles to Markdown headers (#, ##, ###) and converts tables into Markdown tables.
     """
-    if isinstance(content_or_path, (str, Path)):
-        doc = docx.Document(str(content_or_path))
-    else:
-        doc = docx.Document(io.BytesIO(content_or_path))
+    try:
+        if isinstance(content_or_path, (str, Path)):
+            doc = docx.Document(str(content_or_path))
+        else:
+            doc = docx.Document(io.BytesIO(content_or_path))
+    except Exception as e:
+        raise ExtractionError(f"Error al abrir el archivo DOCX: {e}") from e
 
     elements = []
     total_chars = 0
@@ -72,7 +93,6 @@ def extract_text_from_docx(content_or_path: Union[str, Path, bytes]) -> Dict[str
     # Process block elements in document order (paragraphs and tables)
     for block in doc.element.body:
         if block.tag.endswith("p"):  # Paragraph
-            # Find matching paragraph object
             p = next((p_obj for p_obj in doc.paragraphs if p_obj._p == block), None)
             if not p:
                 continue
@@ -104,9 +124,8 @@ def extract_text_from_docx(content_or_path: Union[str, Path, bytes]) -> Dict[str
 
             table_lines = []
             header_processed = False
-            for row_idx, row in enumerate(tbl.rows):
-                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
-                # Avoid empty rows
+            for row in tbl.rows:
+                cells = [c.text.strip().replace("\n", " ").replace("|", "\\|") for c in row.cells]
                 if not any(cells):
                     continue
                 row_str = "| " + " | ".join(cells) + " |"
@@ -313,16 +332,19 @@ def extract_document_content(
         res = extract_text_from_doc(file_bytes_or_path)
     elif ext in (".md", ".txt"):
         if isinstance(file_bytes_or_path, (str, Path)):
-            raw_text = Path(file_bytes_or_path).read_text(encoding="utf-8", errors="replace")
+            raw_text = Path(file_bytes_or_path).read_text(encoding="utf-8-sig", errors="replace")
         else:
             try:
-                raw_text = file_bytes_or_path.decode("utf-8")
+                raw_text = file_bytes_or_path.decode("utf-8-sig")
             except UnicodeDecodeError:
                 raw_text = file_bytes_or_path.decode("cp1252", errors="replace")
+        cleaned_txt = raw_text.strip()
+        if len(cleaned_txt) < 10:
+            raise ExtractionError("El archivo de texto no contiene contenido suficiente para indexar.")
         res = {
-            "text": raw_text.strip(),
+            "text": cleaned_txt,
             "format": ext.lstrip("."),
-            "char_count": len(raw_text)
+            "char_count": len(cleaned_txt)
         }
     else:
         raise ExtractionError(f"Formato no soportado: '{ext}'. Formatos admitidos: .pdf, .docx, .doc, .md, .txt")

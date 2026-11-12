@@ -4,6 +4,7 @@ Hybrid Retriever module (v2.2) combining:
 - Two-Phase Dense Vector Cosine Similarity (loads only IDs & BLOBs first, then fetches text for Top-K).
 - Reciprocal Rank Fusion (RRF) with true pure-lexical (alpha=1.0) and pure-vector (alpha=0.0) modes.
 """
+import threading
 import time
 import json
 import sqlite3
@@ -27,10 +28,77 @@ def _strip_accents(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
 
 
+class VectorMatrixCache:
+    """
+    Thread-safe in-memory dense vector matrix cache.
+    Eliminates redundant SQLite BLOB reads across queries while validating BLOB sizes
+    and detecting schema/content mutations.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def get_or_load(self, conn: sqlite3.Connection, db_key: str, dim: int) -> Dict[str, Any]:
+        cur = conn.cursor()
+        sig_row = cur.execute(
+            "SELECT count(id), coalesce(max(id), 0), coalesce(sum(length(content)), 0) FROM chunks;"
+        ).fetchone()
+        sig = (sig_row[0], sig_row[1], sig_row[2], dim) if sig_row else (0, 0, 0, dim)
+
+        with self._lock:
+            cached = self._cache.get(db_key)
+            if cached and cached["sig"] == sig:
+                return cached
+
+            rows = cur.execute("SELECT id, department_id, embedding FROM chunks ORDER BY id ASC;").fetchall()
+            expected_bytes = dim * 4
+            valid_ids = []
+            valid_depts = []
+            valid_blobs = []
+            for r in rows:
+                blob = r["embedding"]
+                if blob and len(blob) == expected_bytes:
+                    valid_ids.append(r["id"])
+                    valid_depts.append(r["department_id"])
+                    valid_blobs.append(blob)
+
+            if not valid_ids:
+                empty = {
+                    "sig": sig,
+                    "ids": np.array([], dtype=np.int64),
+                    "departments": [],
+                    "matrix": np.empty((0, dim), dtype=np.float32)
+                }
+                self._cache[db_key] = empty
+                return empty
+
+            data = {
+                "sig": sig,
+                "ids": np.array(valid_ids, dtype=np.int64),
+                "departments": valid_depts,
+                "matrix": np.frombuffer(b"".join(valid_blobs), dtype=np.float32).reshape(-1, dim)
+            }
+            self._cache[db_key] = data
+            return data
+
+    def invalidate(self, db_key: Optional[str] = None) -> None:
+        with self._lock:
+            if db_key:
+                self._cache.pop(str(db_key), None)
+            else:
+                self._cache.clear()
+
+
+GLOBAL_VECTOR_CACHE = VectorMatrixCache()
+
+
 class HybridRetriever:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
         self.embedder = get_embedding_engine()
+
+    def invalidate_cache(self) -> None:
+        GLOBAL_VECTOR_CACHE.invalidate(str(self.db_path))
 
     def _clean_fts_query(self, query: str) -> str:
         """
@@ -147,45 +215,38 @@ class HybridRetriever:
         limit: int = 25
     ) -> List[Dict[str, Any]]:
         """
-        Two-Phase Dense Vector Search:
-        Phase 1: Load only (id, embedding) BLOBs and compute BLAS dot product.
-        Phase 2: Fetch full text/metadata ONLY for the top `limit` chunk IDs.
+        Two-Phase Dense Vector Search with In-Memory Matrix Cache:
+        Phase 1: BLAS dot product against cached normalized float32 matrix.
+        Phase 2: Fetch full text/metadata ONLY for the winning `limit` chunk IDs.
         """
         query_vec = self.embedder.embed_text(query)
         dim = len(query_vec)
-        expected_bytes = dim * 4
+        cache_data = GLOBAL_VECTOR_CACHE.get_or_load(conn, str(self.db_path), dim)
 
-        cur = conn.cursor()
+        if len(cache_data["ids"]) == 0:
+            return []
 
-        # Phase 1: Lightweight scan of IDs and embedding BLOBs
         if department_filter:
-            cur.execute("SELECT id, embedding FROM chunks WHERE department_id = ?;", (department_filter,))
+            mask = np.array([d == department_filter for d in cache_data["departments"]], dtype=bool)
+            if not np.any(mask):
+                return []
+            sub_matrix = cache_data["matrix"][mask]
+            sub_ids = cache_data["ids"][mask]
+            similarities = self.embedder.compute_cosine_similarity(query_vec, sub_matrix)
+            top_sub_idx = np.argsort(similarities)[::-1][:limit]
+            winning_ids = [int(sub_ids[i]) for i in top_sub_idx]
+            sim_by_id = {int(sub_ids[i]): float(similarities[i]) for i in top_sub_idx}
         else:
-            cur.execute("SELECT id, embedding FROM chunks;")
+            similarities = self.embedder.compute_cosine_similarity(query_vec, cache_data["matrix"])
+            top_indices = np.argsort(similarities)[::-1][:limit]
+            winning_ids = [int(cache_data["ids"][i]) for i in top_indices]
+            sim_by_id = {int(cache_data["ids"][i]): float(similarities[i]) for i in top_indices}
 
-        rows = cur.fetchall()
-        if not rows:
+        if not winning_ids:
             return []
-
-        chunk_ids = []
-        blobs = []
-        for r in rows:
-            blob = r["embedding"]
-            if blob and len(blob) == expected_bytes:
-                chunk_ids.append(r["id"])
-                blobs.append(blob)
-
-        if not chunk_ids:
-            return []
-
-        matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(-1, dim)
-        similarities = self.embedder.compute_cosine_similarity(query_vec, matrix)
-
-        top_indices = np.argsort(similarities)[::-1][:limit]
-        winning_ids = [chunk_ids[i] for i in top_indices]
-        sim_by_id = {chunk_ids[i]: float(similarities[i]) for i in top_indices}
 
         # Phase 2: Fetch text & metadata only for the winning IDs
+        cur = conn.cursor()
         placeholders = ",".join("?" for _ in winning_ids)
         cur.execute(f"""
             SELECT id, document_id, title, department_id, content, metadata_json

@@ -1,12 +1,14 @@
-// Frontend JavaScript for Club Atlético Puerto Marina RAG (v2.2)
+// Frontend JavaScript for Club Atlético Puerto Marina RAG (v3.0)
 
 const API_BASE = "";
 let currentAlpha = 0.5;
 let bannerTimer = null;
+let selectedFiles = [];
 
 document.addEventListener("DOMContentLoaded", () => {
     initNavigation();
     initControls();
+    initUploadControls();
     setDefaultIngestDate();
     loadStats();
     loadLlmHealth();
@@ -493,13 +495,15 @@ async function loadDocuments() {
         docs.forEach(d => {
             const row = document.createElement("tr");
             const isVirtualSql = String(d.file_path || "").startsWith("sqlite://");
+            const fmt = String(d.source_type || (isVirtualSql ? "sql" : "md")).toUpperCase();
             row.innerHTML = `
                 <td><code>${escapeHtml(d.doc_code)}</code></td>
                 <td><strong>${escapeHtml(d.title)}</strong></td>
                 <td><span class="badge badge-info">${escapeHtml(d.department_name)}</span></td>
                 <td>${escapeHtml(d.author)}</td>
+                <td><span class="badge badge-gold">${escapeHtml(fmt)}</span></td>
                 <td>${escapeHtml(d.date)}</td>
-                <td><span class="badge badge-gold">${escapeHtml(d.chunk_count)} chunks</span></td>
+                <td><span class="badge badge-info">${escapeHtml(d.chunk_count)} chunks</span></td>
                 <td style="white-space: nowrap;">
                     <button type="button" class="mini-action-btn view-doc-btn">👁️ Ver</button>
                     ${isVirtualSql ? "" : '<button type="button" class="mini-action-btn danger del-doc-btn" style="margin-left: 4px;">🗑️</button>'}
@@ -528,8 +532,10 @@ async function openDocumentModal(docId) {
     try {
         const data = await fetchJson(`${API_BASE}/api/documents/${docId}`);
         const doc = data.document;
+        const fmt = String(doc.source_type || "md").toUpperCase();
+        const origPart = doc.original_filename ? ` | Archivo: ${doc.original_filename}` : "";
         titleEl.textContent = `${doc.doc_code} — ${doc.title}`;
-        metaEl.textContent = `Área: ${doc.department_id} | Autor: ${doc.author} | Fecha: ${doc.date} | Tags: ${doc.tags || "-"}`;
+        metaEl.textContent = `Área: ${doc.department_id} | Formato: ${fmt}${origPart} | Autor: ${doc.author} | Fecha: ${doc.date} | Tags: ${doc.tags || "-"}`;
         contentEl.innerHTML = formatMarkdown(doc.raw_content);
 
         chunksEl.innerHTML = "";
@@ -645,3 +651,183 @@ async function handleIngestSubmit(e) {
     }
 }
 
+function initUploadControls() {
+    const dropzone = document.getElementById("dropzone");
+    const fileInput = document.getElementById("file-input");
+    const uploadForm = document.getElementById("upload-form");
+    if (!dropzone || !fileInput || !uploadForm) return;
+
+    dropzone.addEventListener("click", () => fileInput.click());
+    dropzone.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            fileInput.click();
+        }
+    });
+
+    dropzone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropzone.classList.add("dragover");
+    });
+
+    dropzone.addEventListener("dragleave", () => {
+        dropzone.classList.remove("dragover");
+    });
+
+    dropzone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropzone.classList.remove("dragover");
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            addFilesToQueue(e.dataTransfer.files);
+        }
+    });
+
+    fileInput.addEventListener("change", (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+            addFilesToQueue(e.target.files);
+            fileInput.value = "";
+        }
+    });
+
+    uploadForm.addEventListener("submit", handleUploadSubmit);
+}
+
+function addFilesToQueue(fileList) {
+    const allowedExts = [".pdf", ".docx", ".doc", ".md", ".txt"];
+    let rejected = [];
+    for (const f of fileList) {
+        const dotIdx = f.name.lastIndexOf(".");
+        const ext = dotIdx >= 0 ? f.name.slice(dotIdx).toLowerCase() : "";
+        if (!allowedExts.includes(ext)) {
+            rejected.push(f.name);
+            continue;
+        }
+        const exists = selectedFiles.some(sf => sf.name === f.name && sf.size === f.size);
+        if (!exists) {
+            selectedFiles.push(f);
+        }
+    }
+    if (rejected.length > 0) {
+        showBanner(
+            `Formato no soportado en: ${rejected.join(", ")}. Permitidos: PDF, DOCX, DOC, MD, TXT.`,
+            "error"
+        );
+    }
+    renderFileQueue();
+}
+
+function formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function getFileIcon(filename) {
+    const ext = filename.includes(".") ? filename.split(".").pop().toLowerCase() : "";
+    if (ext === "pdf") return "📕";
+    if (ext === "docx") return "📘";
+    if (ext === "doc") return "📄";
+    if (ext === "md") return "📝";
+    return "📋";
+}
+
+function renderFileQueue() {
+    const queueEl = document.getElementById("file-queue");
+    const submitBtn = document.getElementById("upload-submit-btn");
+    if (!queueEl || !submitBtn) return;
+
+    queueEl.innerHTML = "";
+    if (selectedFiles.length === 0) {
+        queueEl.style.display = "none";
+        submitBtn.disabled = true;
+        return;
+    }
+
+    queueEl.style.display = "flex";
+    submitBtn.disabled = false;
+
+    selectedFiles.forEach((f, idx) => {
+        const item = document.createElement("div");
+        item.className = "file-queue-item";
+        item.innerHTML = `
+            <div class="file-queue-left">
+                <span>${getFileIcon(f.name)}</span>
+                <div>
+                    <strong style="color: #fff;">${escapeHtml(f.name)}</strong>
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">${formatBytes(f.size)}</div>
+                </div>
+            </div>
+            <button type="button" class="file-remove-btn" title="Quitar de la cola">✕</button>
+        `;
+        item.querySelector(".file-remove-btn").addEventListener("click", () => {
+            selectedFiles.splice(idx, 1);
+            renderFileQueue();
+        });
+        queueEl.appendChild(item);
+    });
+}
+
+async function handleUploadSubmit(e) {
+    e.preventDefault();
+    if (selectedFiles.length === 0) return;
+
+    const btn = document.getElementById("upload-submit-btn");
+    const resultsEl = document.getElementById("upload-results");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Extrayendo texto, generando chunks e indexando...';
+
+    const formData = new FormData();
+    selectedFiles.forEach(file => formData.append("files", file));
+    formData.append("department_id", document.getElementById("upload-dept").value);
+    formData.append("author", document.getElementById("upload-author").value.trim() || "Staff Técnico");
+    formData.append("tags", document.getElementById("upload-tags").value.trim());
+
+    try {
+        const data = await fetchJson(`${API_BASE}/api/upload`, {
+            method: "POST",
+            body: formData
+        });
+
+        resultsEl.innerHTML = "";
+        resultsEl.style.display = "grid";
+
+        (data.details || []).forEach(resItem => {
+            const card = document.createElement("div");
+            card.className = `upload-result-card ${resItem.status === "success" ? "success" : "error"}`;
+            const badgeHtml = resItem.status === "success"
+                ? `<span class="badge badge-success">${escapeHtml(resItem.chunks_created)} chunks</span>`
+                : `<span class="badge badge-danger">Error</span>`;
+            const codeHtml = resItem.doc_code
+                ? `<div style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Código: <code>${escapeHtml(resItem.doc_code)}</code></div>`
+                : "";
+            card.innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; margin-bottom:0.4rem;">
+                    <strong style="color:#fff; word-break:break-word;">${escapeHtml(resItem.filename)}</strong>
+                    ${badgeHtml}
+                </div>
+                <div style="font-size:0.82rem; color:#cbd5e1;">${escapeHtml(resItem.message)}</div>
+                ${codeHtml}
+            `;
+            resultsEl.appendChild(card);
+        });
+
+        if (data.successful > 0 && data.failed === 0) {
+            showBanner(`Se indexaron ${data.successful} archivo(s) correctamente en la base RAG.`, "success");
+            selectedFiles = [];
+            renderFileQueue();
+        } else if (data.successful > 0) {
+            showBanner(`Carga parcial: ${data.successful} indexado(s), ${data.failed} con error.`, "info");
+            selectedFiles = [];
+            renderFileQueue();
+        } else {
+            showBanner(`No se pudo indexar ningún archivo (${data.failed} error(es)).`, "error");
+        }
+
+        await Promise.all([loadStats(), loadDocuments()]);
+    } catch (err) {
+        showBanner(`Error durante la carga multiformato: ${err.message}`, "error");
+    } finally {
+        btn.disabled = selectedFiles.length === 0;
+        btn.innerHTML = "📤 Subir e Indexar Archivos en RAG";
+    }
+}

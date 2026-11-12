@@ -21,10 +21,11 @@
 
       <nav class="nav-tabs">
         <button class="nav-btn active" data-tab="tab-query">🔎 Consola RAG</button>
+        <button class="nav-btn" data-tab="tab-upload">📤 Subir Archivos</button>
         <button class="nav-btn" data-tab="tab-players">⚽ Plantel</button>
         <button class="nav-btn" data-tab="tab-docs">📄 Documentos</button>
         <button class="nav-btn" data-tab="tab-staff">👔 Staff</button>
-        <button class="nav-btn" data-tab="tab-ingest">📥 Ingesta en Vivo</button>
+        <button class="nav-btn" data-tab="tab-ingest">📥 Editor Markdown</button>
         <button class="nav-btn" data-tab="tab-logs">📊 Telemetría</button>
       </nav>
     </div>
@@ -162,6 +163,64 @@
       </div>
     </section>
 
+    <!-- TAB: Multi-file Upload -->
+    <section id="tab-upload" class="tab-pane">
+      <div class="form-card" style="max-width: 900px; margin: 0 auto;">
+        <h2 style="font-size: 1.3rem; color: #fff; margin-bottom: 0.5rem;">Carga Multiformato de Documentos (RAG v3.0)</h2>
+        <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem;">
+          Subí uno o múltiples archivos oficiales (<strong>PDF, DOCX, DOC, Markdown o TXT</strong>). El motor validará su formato, extraerá su contenido estructurado preservando tablas y títulos, calculará embeddings vectoriales multilingües y los integrará instantáneamente a la búsqueda híbrida.
+        </p>
+
+        <form id="upload-form">
+          <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Seleccionar o arrastrar archivos para subir">
+            <div class="dropzone-icon">📁</div>
+            <div class="dropzone-title">Arrastrá y soltá tus archivos aquí o hacé clic para explorar</div>
+            <div class="dropzone-subtitle">Admite múltiples archivos simultáneos hasta 25 MB por archivo</div>
+            <div class="format-badges-row">
+              <span class="format-pill">📕 PDF (.pdf)</span>
+              <span class="format-pill">📘 Word (.docx)</span>
+              <span class="format-pill">📄 Word 97-2003 (.doc)</span>
+              <span class="format-pill">📝 Markdown (.md)</span>
+              <span class="format-pill">📋 Texto (.txt)</span>
+            </div>
+            <input type="file" id="file-input" multiple style="display: none;" accept=".pdf,.docx,.doc,.md,.txt">
+          </div>
+
+          <div id="file-queue" class="file-queue" style="display: none;"></div>
+
+          <div class="form-row-2col" style="margin-top: 1rem;">
+            <div class="form-group">
+              <label class="form-label" for="upload-dept">Departamento de Destino:</label>
+              <select id="upload-dept" class="form-select" required>
+                <option value="servicio_medico">Servicio Médico y Fisioterapia</option>
+                <option value="preparacion_fisica">Preparación Física y GPS</option>
+                <option value="cuerpo_tecnico" selected>Cuerpo Técnico y Táctica</option>
+                <option value="nutricion">Nutrición y Rendimiento</option>
+                <option value="scouting">Scouting e Inteligencia</option>
+                <option value="logistica_viajes">Operaciones y Logística</option>
+                <option value="disciplina_prensa">Prensa y Reglamento</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="upload-author">Autor / Especialista Emisor:</label>
+              <input type="text" id="upload-author" class="form-input" placeholder="Staff Técnico / Profesional Responsable" value="Secretaría Técnica">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="upload-tags">Etiquetas temáticas (separadas por coma):</label>
+            <input type="text" id="upload-tags" class="form-input" placeholder="semifinal, táctica, scouting, nutrición, informe">
+          </div>
+
+          <button type="submit" id="upload-submit-btn" class="query-submit-btn" style="width: 100%; justify-content: center; padding: 0.9rem;" disabled>
+            📤 Subir e Indexar Archivos en RAG
+          </button>
+        </form>
+
+        <div id="upload-results" class="upload-results-grid" style="display: none;"></div>
+      </div>
+    </section>
+
     <!-- TAB 2: Players Roster -->
     <section id="tab-players" class="tab-pane">
       <div style="margin-bottom: 1.5rem;">
@@ -185,6 +244,7 @@
               <th>Título</th>
               <th>Departamento</th>
               <th>Autor</th>
+              <th>Formato</th>
               <th>Fecha</th>
               <th>Chunks</th>
               <th>Acciones</th>

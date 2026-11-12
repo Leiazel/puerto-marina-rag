@@ -784,6 +784,124 @@ footer {
   padding: 1rem;
 }
 
+/* Multi-File Upload Dropzone Styles */
+.dropzone {
+  border: 2px dashed rgba(245, 158, 11, 0.45);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.6);
+  padding: 2.25rem 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.25s ease;
+  margin-bottom: 1.25rem;
+}
+
+.dropzone:hover,
+.dropzone:focus-visible,
+.dropzone.dragover {
+  border-color: var(--gold-accent);
+  background: rgba(245, 158, 11, 0.08);
+  transform: translateY(-2px);
+  outline: none;
+}
+
+.dropzone-icon {
+  font-size: 2.4rem;
+  margin-bottom: 0.65rem;
+}
+
+.dropzone-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 0.35rem;
+}
+
+.dropzone-subtitle {
+  font-size: 0.84rem;
+  color: var(--text-muted);
+}
+
+.format-badges-row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+.format-pill {
+  font-size: 0.75rem;
+  padding: 0.22rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #cbd5e1;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.file-queue {
+  margin-bottom: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.file-queue-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  font-size: 0.88rem;
+}
+
+.file-queue-left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.file-remove-btn {
+  background: transparent;
+  border: none;
+  color: #f87171;
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 4px;
+}
+
+.file-remove-btn:hover {
+  background: rgba(239, 68, 68, 0.18);
+  color: #fff;
+}
+
+.upload-results-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.upload-result-card {
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 1rem;
+  border-left: 4px solid var(--gold-accent);
+}
+
+.upload-result-card.success {
+  border-left-color: #10b981;
+}
+
+.upload-result-card.error {
+  border-left-color: #ef4444;
+}
+
 @media (max-width: 768px) {
   header {
     padding: 1rem;

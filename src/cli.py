@@ -120,6 +120,9 @@ def main():
     parser.add_argument("--interactive", "-i", action="store_true", help="Iniciar sesión interactiva")
     parser.add_argument("--stats", "-s", action="store_true", help="Mostrar estadísticas de la base de datos")
     parser.add_argument("--reindex", "-r", action="store_true", help="Reindexar todos los documentos de la carpeta data")
+    parser.add_argument("--upload", "-u", nargs="+", help="Subir e indexar uno o más archivos (PDF, DOCX, DOC, MD, TXT)")
+    parser.add_argument("--author", type=str, default="Staff Técnico", help="Autor del documento subido")
+    parser.add_argument("--tags", type=str, default="", help="Etiquetas para documentos subidos (separadas por coma)")
 
     args = parser.parse_args()
 
@@ -136,6 +139,61 @@ def main():
         return
 
     _ensure_db_initialized()
+
+    if args.upload:
+        print_banner()
+        from src.config import UPLOADS_DIR, ALLOWED_UPLOAD_EXTENSIONS, MAX_UPLOAD_SIZE_BYTES
+        from src.database import get_db_connection
+        from src.embeddings import get_embedding_engine
+        from src.ingestion import ingest_uploaded_file
+
+        dept_id = args.dept or "cuerpo_tecnico"
+        print(f"📤 Iniciando subida de {len(args.upload)} archivo(s) al departamento '{dept_id}'...")
+        conn = get_db_connection(DB_PATH)
+        embedder = get_embedding_engine()
+        uploads_root = UPLOADS_DIR.resolve()
+        dest_dir = (uploads_root / dept_id).resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            for file_str in args.upload:
+                file_path = Path(file_str)
+                if not file_path.exists() or not file_path.is_file():
+                    print(f"❌ Archivo no encontrado: {file_str}")
+                    continue
+                if file_path.suffix.lower() not in ALLOWED_UPLOAD_EXTENSIONS:
+                    print(f"❌ Extensión no soportada '{file_path.suffix}' en {file_path.name}")
+                    continue
+                raw_bytes = file_path.read_bytes()
+                if len(raw_bytes) == 0 or len(raw_bytes) > MAX_UPLOAD_SIZE_BYTES:
+                    print(f"❌ Tamaño inválido en {file_path.name} ({len(raw_bytes)} bytes)")
+                    continue
+                try:
+                    safe_name = file_path.name
+                    dest_file = (dest_dir / safe_name).resolve()
+                    if not dest_file.is_relative_to(dest_dir):
+                        print(f"❌ Ruta de destino inválida para {file_path.name}")
+                        continue
+                    doc_id, count, doc_code = ingest_uploaded_file(
+                        file_path=dest_file,
+                        original_filename=file_path.name,
+                        department_id=dept_id,
+                        author=args.author,
+                        tags=args.tags,
+                        conn=conn,
+                        embedder=embedder,
+                        file_bytes=raw_bytes,
+                        write_to_disk=True
+                    )
+                    print(f"✅ [{file_path.name}] -> Código {doc_code} (Doc ID {doc_id}: {count} chunks indexados)")
+                except Exception as e:
+                    print(f"❌ Error al procesar {file_path.name}: {e}")
+        finally:
+            conn.close()
+
+        print("\n✨ Proceso de carga y sincronización completado.")
+        return
+
     pipeline = ClubRAGPipeline()
 
     if args.stats:

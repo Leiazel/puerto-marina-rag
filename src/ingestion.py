@@ -5,15 +5,31 @@ Ingestion pipeline module for Club Atlético Puerto Marina (v2.2).
 - Eliminates empty/separator-only/heading-only junk chunks.
 - Automatically indexes relational SQL tables (players, staff, departments) into RAG chunks.
 """
+import hashlib
 import re
 import json
+from datetime import date as dt_date
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 import yaml
 
-from src.config import BASE_DIR, RAW_DOCS_DIR, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS, DB_PATH
+from src.config import (
+    BASE_DIR,
+    RAW_DOCS_DIR,
+    UPLOADS_DIR,
+    ALLOWED_UPLOAD_EXTENSIONS,
+    CHUNK_SIZE_CHARS,
+    CHUNK_OVERLAP_CHARS,
+    DB_PATH,
+)
 from src.database import get_db_connection, init_database
 from src.embeddings import get_embedding_engine
+from src.extractors import (
+    extract_document_content,
+    validate_file_magic_bytes,
+    ExtractionError,
+)
+from src.retriever import GLOBAL_VECTOR_CACHE
 
 INITIAL_DEPARTMENTS = [
     {
@@ -288,14 +304,64 @@ def _split_table_preserving_header(table_text: str, heading_prefix: str, max_bod
     return chunks
 
 
+def _split_long_line(line: str, max_chars: int, overlap_chars: int) -> List[str]:
+    """Splits a single oversized paragraph/line by sentence boundaries, then sliding word window."""
+    if len(line) <= max_chars:
+        return [line]
+
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', line) if s.strip()]
+    parts: List[str] = []
+    buf: List[str] = []
+    cur_len = 0
+
+    for sent in sentences:
+        if len(sent) > max_chars:
+            if buf:
+                parts.append(" ".join(buf))
+                buf = []
+                cur_len = 0
+            start = 0
+            step = max(50, max_chars - overlap_chars)
+            while start < len(sent):
+                end = min(start + max_chars, len(sent))
+                parts.append(sent[start:end])
+                if end == len(sent):
+                    break
+                start += step
+            continue
+
+        if buf and cur_len + len(sent) + 1 > max_chars:
+            parts.append(" ".join(buf))
+            if len(buf[-1]) <= overlap_chars:
+                buf = [buf[-1], sent]
+                cur_len = len(buf[0]) + len(sent) + 1
+            else:
+                buf = [sent]
+                cur_len = len(sent)
+        else:
+            buf.append(sent)
+            cur_len += len(sent) + 1
+
+    if buf:
+        parts.append(" ".join(buf))
+    return parts
+
+
 def _split_text_lines(text: str, max_body_chars: int, overlap_chars: int) -> List[str]:
-    """Splits long prose or list blocks by line boundaries with clean overlap."""
+    """Splits long prose or list blocks by line boundaries (and sentence/window fallback) with clean overlap."""
     if len(text) <= max_body_chars:
         return [text]
 
-    lines = [l for l in text.splitlines() if l.strip()]
-    if not lines:
+    raw_lines = [l for l in text.splitlines() if l.strip()]
+    if not raw_lines:
         return []
+
+    lines: List[str] = []
+    for raw_l in raw_lines:
+        if len(raw_l) > max_body_chars:
+            lines.extend(_split_long_line(raw_l, max_body_chars, overlap_chars))
+        else:
+            lines.append(raw_l)
 
     chunks: List[str] = []
     current_lines: List[str] = []
@@ -427,7 +493,7 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
             body_chunks.append("\n\n".join(current_buf))
 
     final_chunks = []
-    for chunk_idx, body in enumerate(body_chunks):
+    for body in body_chunks:
         if _is_heading_only(body):
             continue
         label = "Sección" if len(body_chunks) == 1 else "Parte"
@@ -440,7 +506,8 @@ def chunk_document(doc_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "doc_code": doc_meta["doc_code"],
                 "date": date_str,
                 "author": author,
-                "tags": tags
+                "tags": tags,
+                "source_type": doc_meta.get("source_type", "markdown")
             }
         })
 
@@ -455,10 +522,24 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
     if not cur.fetchone():
         doc_meta["department_id"] = "cuerpo_tecnico"
 
+    source_type = doc_meta.get("source_type", "markdown")
+    file_path_str = str(doc_meta.get("file_path") or "")
+    original_filename = doc_meta.get("original_filename") or (
+        Path(file_path_str).name if file_path_str and not file_path_str.startswith("sqlite://") else ""
+    )
+    content_hash = doc_meta.get("content_hash") or hashlib.sha256(
+        doc_meta["raw_content"].encode("utf-8")
+    ).hexdigest()
+    file_size_bytes = int(doc_meta.get("file_size_bytes") or len(doc_meta["raw_content"].encode("utf-8")))
+
     try:
         cur.execute("""
-            INSERT INTO documents (doc_code, title, department_id, author, date, file_path, confidentiality, tags, raw_content)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents (
+                doc_code, title, department_id, author, date, file_path,
+                confidentiality, tags, raw_content, source_type,
+                original_filename, content_hash, file_size_bytes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(doc_code) DO UPDATE SET
                 title=excluded.title,
                 department_id=excluded.department_id,
@@ -467,7 +548,11 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
                 file_path=excluded.file_path,
                 confidentiality=excluded.confidentiality,
                 tags=excluded.tags,
-                raw_content=excluded.raw_content
+                raw_content=excluded.raw_content,
+                source_type=excluded.source_type,
+                original_filename=excluded.original_filename,
+                content_hash=excluded.content_hash,
+                file_size_bytes=excluded.file_size_bytes
             RETURNING id;
         """, (
             doc_meta["doc_code"],
@@ -475,10 +560,14 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
             doc_meta["department_id"],
             doc_meta["author"],
             doc_meta["date"],
-            doc_meta["file_path"],
-            doc_meta["confidentiality"],
-            doc_meta["tags"],
-            doc_meta["raw_content"]
+            file_path_str,
+            doc_meta.get("confidentiality", "interno"),
+            doc_meta.get("tags", ""),
+            doc_meta["raw_content"],
+            source_type,
+            original_filename,
+            content_hash,
+            file_size_bytes
         ))
         row = cur.fetchone()
         doc_id = row[0] if row else None
@@ -497,6 +586,7 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
         chunks = chunk_document(doc_meta)
         if not chunks:
             conn.commit()
+            GLOBAL_VECTOR_CACHE.invalidate()
             return doc_id, 0
 
         chunk_texts = [c["content"] for c in chunks]
@@ -517,13 +607,78 @@ def ingest_doc_metadata_dict(doc_meta: Dict[str, Any], conn, embedder) -> Tuple[
             cur.execute("""
                 INSERT INTO chunks_fts (rowid, chunk_id, title, department_id, content, tags)
                 VALUES (?, ?, ?, ?, ?, ?);
-            """, (chunk_id, str(chunk_id), c["title"], c["department_id"], c["content"], doc_meta["tags"]))
+            """, (chunk_id, str(chunk_id), c["title"], c["department_id"], c["content"], doc_meta.get("tags", "")))
 
         conn.commit()
+        GLOBAL_VECTOR_CACHE.invalidate()
         return doc_id, len(chunks)
     except Exception:
         conn.rollback()
         raise
+
+
+def ingest_uploaded_file(
+    file_path: Path,
+    original_filename: str,
+    department_id: str,
+    author: str,
+    tags: str,
+    conn,
+    embedder,
+    file_bytes: Optional[bytes] = None,
+    write_to_disk: bool = False
+) -> Tuple[int, int, str]:
+    """
+    Validates, extracts, optionally writes, deduplicates (department-scoped SHA-256),
+    and indexes an uploaded file (.pdf, .docx, .doc, .md, .txt).
+    Extraction and magic-byte validation happen BEFORE writing to disk so invalid files leave no residue.
+    """
+    if file_bytes is None:
+        file_bytes = file_path.read_bytes()
+
+    validate_file_magic_bytes(original_filename, file_bytes)
+    extraction = extract_document_content(file_bytes, original_filename)
+
+    content_hash = hashlib.sha256(file_bytes).hexdigest()
+    file_size_bytes = len(file_bytes)
+    raw_markdown = extraction["text"]
+    inferred_title = extraction.get("inferred_title", Path(original_filename).stem.replace("-", " ").title())
+    source_format = extraction.get("format", Path(original_filename).suffix.lstrip("."))
+
+    if write_to_disk:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(file_bytes)
+
+    cur = conn.cursor()
+    existing = cur.execute(
+        "SELECT doc_code FROM documents WHERE content_hash = ? AND department_id = ?",
+        (content_hash, department_id)
+    ).fetchone()
+    if existing:
+        doc_code = existing["doc_code"]
+    else:
+        dept_prefix = (department_id[:3] if department_id else "GEN").upper()
+        slug = re.sub(r'[^a-zA-Z0-9]', '', Path(original_filename).stem)[:12].upper() or "FILE"
+        doc_code = f"UPL-{dept_prefix}-{slug}-{content_hash[:6].upper()}"
+
+    doc_meta = {
+        "doc_code": doc_code,
+        "title": inferred_title,
+        "department_id": department_id,
+        "author": author or "Staff Técnico",
+        "date": dt_date.today().isoformat(),
+        "confidentiality": "interno",
+        "tags": tags or "",
+        "raw_content": raw_markdown,
+        "file_path": _portable_file_path(file_path),
+        "source_type": source_format,
+        "original_filename": original_filename,
+        "content_hash": content_hash,
+        "file_size_bytes": file_size_bytes
+    }
+
+    doc_id, chunk_count = ingest_doc_metadata_dict(doc_meta, conn, embedder)
+    return doc_id, chunk_count, doc_code
 
 
 def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
@@ -533,7 +688,7 @@ def ingest_document_file(file_path: Path, conn, embedder) -> Tuple[int, int]:
 
 
 def delete_document_by_id(doc_id: int, conn) -> Optional[Dict[str, Any]]:
-    """Deletes a document and cleans up its chunks and FTS5 index entries."""
+    """Deletes a document and cleans up its chunks, FTS5 entries, and vector matrix cache."""
     cur = conn.cursor()
     cur.execute("SELECT id, doc_code, title, file_path FROM documents WHERE id = ?", (doc_id,))
     doc = cur.fetchone()
@@ -548,6 +703,7 @@ def delete_document_by_id(doc_id: int, conn) -> Optional[Dict[str, Any]]:
         cur.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
         cur.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
         conn.commit()
+        GLOBAL_VECTOR_CACHE.invalidate()
         return dict(doc)
     except Exception:
         conn.rollback()
@@ -587,7 +743,8 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "confidentiality": "interno",
         "tags": "plantel, jugadores, dorsales, altura, peso, edad, posicion, arquero, delantero, defensor, mediocampista",
         "raw_content": "\n".join(roster_lines) + "\n\n" + "\n".join(player_bullets),
-        "file_path": "sqlite://players"
+        "file_path": "sqlite://players",
+        "source_type": "relational_sql"
     }
 
     # 2. Build Virtual Staff & Departments Document from SQL `staff` & `departments`
@@ -621,7 +778,8 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
         "confidentiality": "interno",
         "tags": "staff, directorio, telefono, email, correo, contacto, medico, nutricionista, kinesiologa, entrenador, preparador_fisico",
         "raw_content": "\n".join(staff_lines) + "\n\n" + "\n".join(staff_bullets),
-        "file_path": "sqlite://staff"
+        "file_path": "sqlite://staff",
+        "source_type": "relational_sql"
     }
 
     _, c1 = ingest_doc_metadata_dict(roster_doc, conn, embedder)
@@ -631,9 +789,12 @@ def sync_relational_entities_to_rag(conn, embedder) -> Tuple[int, int]:
 
 def run_full_ingestion(
     db_path: Path = DB_PATH,
-    docs_dir: Path = RAW_DOCS_DIR
+    docs_dir: Path = RAW_DOCS_DIR,
+    uploads_dir: Optional[Path] = None
 ) -> Dict[str, Any]:
-    """Runs end-to-end ingestion over all markdown files AND relational SQL tables, cleaning orphan docs."""
+    """Runs end-to-end ingestion over markdown files, uploaded files, and SQL tables, cleaning orphan docs."""
+    effective_uploads_dir = uploads_dir if uploads_dir is not None else (UPLOADS_DIR if docs_dir == RAW_DOCS_DIR else None)
+
     print("1. Inicializando esquema SQLite + FTS5...")
     init_database(db_path)
     conn = get_db_connection(db_path)
@@ -657,6 +818,38 @@ def run_full_ingestion(
             total_chunks += count
             print(f"   -> [MD] {f.name} (Doc ID {doc_id}: {count} chunks)")
 
+        if effective_uploads_dir and effective_uploads_dir.exists():
+            uploaded_files = sorted(
+                f for f in effective_uploads_dir.rglob("*")
+                if f.is_file() and f.suffix.lower() in ALLOWED_UPLOAD_EXTENSIONS
+            )
+            if uploaded_files:
+                print(f"   Reindexando {len(uploaded_files)} documentos cargados desde {effective_uploads_dir}...")
+            for uf in uploaded_files:
+                dept_guess = uf.parent.name if uf.parent != effective_uploads_dir else "cuerpo_tecnico"
+                try:
+                    existing_meta = conn.execute(
+                        "SELECT author, tags FROM documents WHERE file_path = ? OR original_filename = ? LIMIT 1",
+                        (_portable_file_path(uf), uf.name)
+                    ).fetchone()
+                    u_author = existing_meta["author"] if existing_meta else "Staff Técnico"
+                    u_tags = existing_meta["tags"] if existing_meta else ""
+                    doc_id, count, doc_code = ingest_uploaded_file(
+                        file_path=uf,
+                        original_filename=uf.name,
+                        department_id=dept_guess,
+                        author=u_author,
+                        tags=u_tags,
+                        conn=conn,
+                        embedder=embedder
+                    )
+                    active_doc_codes.add(doc_code)
+                    total_docs += 1
+                    total_chunks += count
+                    print(f"   -> [UPLOAD] {uf.name} (Doc ID {doc_id}: {count} chunks)")
+                except ExtractionError as ee:
+                    print(f"   Warning: no se pudo reindexar archivo cargado {uf.name}: {ee}")
+
         print("4. Sincronizando tablas relacionales SQL (players, staff, departments) al índice RAG...")
         sql_docs, sql_chunks = sync_relational_entities_to_rag(conn, embedder)
         total_docs += sql_docs
@@ -675,6 +868,7 @@ def run_full_ingestion(
         if removed_count:
             print(f"5. Limpieza completada: {removed_count} documentos huérfanos eliminados del índice.")
 
+        GLOBAL_VECTOR_CACHE.invalidate()
         print(f"Ingesta completada con éxito: {total_docs} documentos y {total_chunks} fragmentos activos.")
         return {
             "documents_count": total_docs,

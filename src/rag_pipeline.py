@@ -98,6 +98,10 @@ class ClubRAGPipeline:
             if conn is not None:
                 conn.close()
 
+    def invalidate_cache(self) -> None:
+        """Invalidates the in-memory dense vector matrix cache."""
+        self.retriever.invalidate_cache()
+
     def get_stats(self) -> Dict[str, Any]:
         conn = get_db_connection(self.db_path)
         try:

@@ -1,28 +1,30 @@
-# ⚽ Club Atlético Puerto Marina - Sistema RAG Híbrido (v2.2)
+# ⚽ Club Atlético Puerto Marina - Sistema RAG Híbrido (v3.0)
 
 Sistema integral de **Generación Aumentada por Recuperación (RAG)** de grado productivo para la gestión operativa, biomédica, táctica y logística de un club de fútbol profesional.
 
-Arquitectura optimizada basada en **SQLite Híbrido** (**FTS5** con ranking **BM25** y filtrado de *stopwords* en español + almacenamiento binario en **BLOB** de vectores densos multilingües con **FastEmbed ONNX** + búsqueda vectorial en dos fases + fusión de rankings mediante **Reciprocal Rank Fusion (RRF)**).
+Arquitectura optimizada basada en **SQLite Híbrido** (**FTS5** con ranking **BM25** y filtrado de *stopwords* en español + caché matricial en RAM con almacenamiento binario en **BLOB** de vectores densos multilingües con **FastEmbed ONNX** + ingesta multiformato `.pdf`, `.docx`, `.doc`, `.md`, `.txt` + fusión de rankings mediante **Reciprocal Rank Fusion (RRF)**).
 
 ---
 
-## 🛠️ Novedades y Optimizaciones (v2.2)
+## 🛠️ Novedades y Optimizaciones (v3.0 + v2.2)
 
-1. **Filtrado de *Stopwords*, Normalización de Diacríticos y Términos Técnicos en FTS5 (`src/retriever.py`):**
-   Elimina conectores vacíos (*"como"*, *"cual"*, *"para"*, *"los"*, *"del"*, etc.) y normaliza tildes antes de armar la consulta `MATCH` con BM25 ponderado por columna, preservando siglas tácticas/métricas de 2 letras (`xG`, `xA`, `DT`, `AT`, `PF`, `ID`).
-2. **Búsqueda Vectorial en Dos Fases y Modos Puros (`src/retriever.py`):**
-   - **Fase 1:** Carga únicamente los pares `(id, embedding)` y ejecuta el producto punto matricial en BLAS/C.
-   - **Fase 2:** Hidrata texto y metadatos **únicamente de los Top-K ganadores**, respetando `alpha=1.0` (léxico puro) y `alpha=0.0` (semántico puro).
-3. **Chunking Consciente de Tablas y Limpieza de Huérfanos (`src/ingestion.py`):**
-   Fragmentación ajustada a la ventana de MiniLM (`900` chars / `180` overlap), preservando encabezados (`| col |` + `|---|`) al dividir tablas largas, evitando chunks huérfanos de solo títulos o separadores `---`, y limpiando documentos obsoletos al reindexar.
-4. **Puente Relacional SQL-a-RAG (`src/ingestion.py`):**
+1. **Ingesta Multiformato Segura (`src/extractors.py`, `POST /api/upload`, `--upload`):**
+   - Soporte nativo para **PDF** (`pypdf`, con detección de PDFs escaneados sin capa OCR), **Word (.docx)** (`python-docx`, preservando títulos y tablas Markdown con pipes escapados), **Word 97-2003 (.doc)** (`olefile` con parsing FIB/PlcPcd y fallback UTF-16LE/CP1252), **Markdown (.md)** y **Texto plano (.txt)**.
+   - Validación de **magic bytes** binarios y tamaño máximo (`25 MB`) *antes* de escribir en `data/uploads/`, deduplicación SHA-256 por departamento y pestaña web **Subir Archivos** con Drag & Drop.
+2. **Caché Matricial Vectorial en RAM (`VectorMatrixCache` en `src/retriever.py`):**
+   - Mantiene en memoria la matriz normalizada `N×384` con validación estricta de longitud BLOB (`dim * 4`), invalidación automática ante ingesta/eliminación/reindexación y verificación de firma `(count, max_id, sum_len, dim)`.
+3. **Filtrado de *Stopwords*, Normalización de Diacríticos y Términos Técnicos en FTS5 (`src/retriever.py`):**
+   Elimina conectores vacíos (*"como"*, *"cual"*, *"para"*, *"los"*, *"del"*, etc.) y normaliza tildes antes de armar la consulta `MATCH` con BM25 ponderado por columna, preservando siglas tácticas/métricas de 2 letras (`xG`, `xA`, `DT`, `AT`, `PF`, `ID`) y modos puros `alpha=1.0` / `alpha=0.0`.
+4. **Chunking Consciente de Tablas, Líneas Largas y Limpieza de Huérfanos (`src/ingestion.py`):**
+   Fragmentación ajustada a la ventana de MiniLM (`900` chars / `180` overlap), preservando encabezados (`| col |` + `|---|`) al dividir tablas largas, dividiendo párrafos extensos sin saltos de línea (`_split_long_line`), evitando chunks huérfanos y preservando archivos subidos al reindexar.
+5. **Puente Relacional SQL-a-RAG (`src/ingestion.py`):**
    Las tablas estructuradas `players` y `staff` se sincronizan automáticamente como documentos virtuales fragmentados y vectorizados.
-5. **Sintetizador Extractivo Mejorado, Guardia Out-of-Domain y Telemetría (`src/generator.py`):**
+6. **Sintetizador Extractivo Mejorado, Guardia Out-of-Domain y Telemetría (`src/generator.py`):**
    Reconstruye múltiples tablas Markdown por fragmento, detecta consultas fuera de dominio (`insufficient_evidence`), protege prompts con delimitadores XML y reporta `fallback_used` / `fallback_reason`.
-6. **Adaptador Universal para LLMs (`src/config.py` y `src/generator.py`):**
+7. **Adaptador Universal para LLMs (`src/config.py` y `src/generator.py`):**
    Funciona 100% local/offline (`USE_EXTERNAL_LLM=false`) o conectado a Ollama (sin API key requerida), Groq, Gemini u OpenAI, con recarga segura de `.env`, backoff ante HTTP 429, auto-descubrimiento ante HTTP 404 y limpieza de bloques `<think>`.
-7. **Suite de 13 Pruebas Automatizadas Aisladas (`tests/test_rag.py`):**
-   Ejecución sobre base de datos y directorio temporal (`tempfile`) para no mutar la base productiva, cubriendo motor híbrido, chunking, LLM mockeado y seguridad/validación en FastAPI (`TestClient`).
+8. **Suite de 18 Pruebas Automatizadas Aisladas (`tests/test_rag.py`):**
+   Ejecución sobre base de datos y directorios temporales (`tempfile`) para no mutar la base productiva, cubriendo motor híbrido, caché matricial, extractores PDF/DOCX/DOC/TXT, chunking, LLM mockeado y endpoints/seguridad en FastAPI (`TestClient`).
 
 ---
 
@@ -127,7 +129,7 @@ Por defecto, `USE_EXTERNAL_LLM=false` utiliza el sintetizador local extractivo d
 - **Consola Web:** [http://127.0.0.1:8000](http://127.0.0.1:8000)
 - **Documentación Swagger:** [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
-### 5. Consultas por Terminal (CLI)
+### 5. Consultas e Ingesta por Terminal (CLI)
 ```bash
 # Consulta puntual
 .venv/bin/python -m src.cli --query "¿Cuál es la lesión de Lautaro Carrizo y cuándo vuelve a jugar?"
@@ -135,8 +137,8 @@ Por defecto, `USE_EXTERNAL_LLM=false` utiliza el sintetizador local extractivo d
 # Consulta con filtro por departamento
 .venv/bin/python -m src.cli --dept preparacion_fisica --query "¿Qué jugador tiene alerta de fatiga en el GPS?"
 
-# Consulta de datos relacionales indexados
-.venv/bin/python -m src.cli --query "¿Cuál es el correo y teléfono de la nutricionista Sofía Carrizo?"
+# Subir e indexar archivo PDF/DOCX/DOC/MD/TXT directo desde CLI
+.venv/bin/python -m src.cli --upload ruta/al/informe.pdf --dept servicio_medico --author "Dr. Arismendi" --tags "lesiones,parte"
 
 # Estadísticas del sistema
 .venv/bin/python -m src.cli --stats
@@ -149,7 +151,7 @@ Por defecto, `USE_EXTERNAL_LLM=false` utiliza el sintetizador local extractivo d
 ```bash
 .venv/bin/pytest -v tests/test_rag.py
 ```
-*(13 pruebas unitarias e integración aisladas que validan esquema, FTS5 BM25, términos técnicos cortos, embeddings, 2-phase vector search, RRF, modos puros alpha 0/1, chunking con preservación de tablas, puente SQL-RAG, LLM mockeado y endpoints/seguridad en FastAPI).*
+*(18 pruebas unitarias e integración aisladas que validan esquema, FTS5 BM25, términos técnicos cortos, embeddings, VectorMatrixCache, RRF, modos puros alpha 0/1, chunking con tablas y líneas largas, extractores PDF/DOCX/DOC/TXT y magic bytes, puente SQL-RAG, LLM mockeado y endpoints/seguridad/uploads en FastAPI).*
 
 ---
 
@@ -161,11 +163,12 @@ Por defecto, `USE_EXTERNAL_LLM=false` utiliza el sintetizador local extractivo d
 | `GET` | `/api/status` | Estado del sistema, recuentos de documentos, chunks, modo de síntesis y latencias |
 | `GET` | `/api/llm/health` | Verificación en vivo de conectividad y modelos disponibles en el proveedor LLM |
 | `POST` | `/api/query` | Ejecución de consulta RAG híbrida con citas, confianza dinámica y telemetría de fallback |
-| `POST` | `/api/reindex` | Reindexación completa de documentos Markdown y tablas SQL con limpieza de huérfanos |
-| `GET` | `/api/documents` | Listado de documentos y desglose por departamento |
+| `POST` | `/api/reindex` | Reindexación completa de documentos Markdown, archivos subidos y tablas SQL con limpieza de huérfanos |
+| `POST` | `/api/upload` | Carga multiformato simultánea (`multipart/form-data`) de PDF, DOCX, DOC, MD y TXT con deduplicación SHA-256 |
+| `GET` | `/api/documents` | Listado de documentos y desglose por departamento y formato (`source_type`) |
 | `GET` | `/api/documents/{id}` | Contenido completo de un documento y sus chunks |
-| `POST` | `/api/documents` | Ingesta dinámica segura de nuevos partes o reportes en tiempo real |
-| `DELETE` | `/api/documents/{id}` | Eliminación de documento del índice y disco (protege documentos virtuales SQL) |
+| `POST` | `/api/documents` | Ingesta dinámica segura de nuevos partes Markdown o reportes en tiempo real |
+| `DELETE` | `/api/documents/{id}` | Eliminación de documento del índice y disco en `raw_documents/` o `uploads/` (protege virtuales SQL) |
 | `GET` | `/api/players` | Fichas biomédicas y técnicas del plantel profesional |
 | `GET` | `/api/staff` | Directorio de cuerpo técnico y especialistas |
 | `GET` | `/api/departments` | Catálogo de departamentos operativos |

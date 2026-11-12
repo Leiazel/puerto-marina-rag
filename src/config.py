@@ -77,8 +77,13 @@ _load_env_file(ENV_FILE, override=False)
 
 DATA_DIR = BASE_DIR / "data"
 RAW_DOCS_DIR = DATA_DIR / "raw_documents"
+UPLOADS_DIR = DATA_DIR / "uploads"
 DATABASE_DIR = DATA_DIR / "database"
 DB_PATH = DATABASE_DIR / "club_knowledge.db"
+
+# Upload and security settings
+MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB per file
+ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".doc", ".md", ".txt"}
 
 # Embedding Model (FastEmbed Multilingual ONNX - 384 dimensions)
 EMBEDDING_MODEL_NAME = os.getenv(

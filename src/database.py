@@ -76,9 +76,24 @@ def init_database(db_path: Path = DB_PATH) -> None:
             confidentiality TEXT DEFAULT 'interno',
             tags TEXT,
             raw_content TEXT NOT NULL,
+            source_type TEXT DEFAULT 'markdown',
+            original_filename TEXT,
+            content_hash TEXT,
+            file_size_bytes INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+
+        # Schema migration for existing DBs
+        existing_cols = {row["name"] for row in cur.execute("PRAGMA table_info(documents);").fetchall()}
+        if "source_type" not in existing_cols:
+            cur.execute("ALTER TABLE documents ADD COLUMN source_type TEXT DEFAULT 'markdown';")
+        if "original_filename" not in existing_cols:
+            cur.execute("ALTER TABLE documents ADD COLUMN original_filename TEXT;")
+        if "content_hash" not in existing_cols:
+            cur.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT;")
+        if "file_size_bytes" not in existing_cols:
+            cur.execute("ALTER TABLE documents ADD COLUMN file_size_bytes INTEGER DEFAULT 0;")
 
         # 5. Chunks table (Stores text + float32 vector embedding as BLOB)
         cur.execute("""
@@ -129,6 +144,7 @@ def init_database(db_path: Path = DB_PATH) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_dept ON documents(department_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_date ON documents(date);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_code ON documents(doc_code);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_hash ON documents(content_hash);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_created ON query_logs(created_at DESC, id DESC);")
 
         conn.commit()

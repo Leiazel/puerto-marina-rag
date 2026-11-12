@@ -49,3 +49,6 @@ Thumbs.db
 .vscode/
 .idea/
 .pytest_cache/
+
+# Uploaded documents directory
+data/uploads/

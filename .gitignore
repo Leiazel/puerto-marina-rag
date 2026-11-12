@@ -45,6 +45,7 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# IDE files
+# IDE & test cache files
 .vscode/
 .idea/
+.pytest_cache/

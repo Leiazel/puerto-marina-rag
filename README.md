@@ -1,4 +1,4 @@
-# ⚽ Club Atlético Puerto Marina - Sistema RAG Híbrido (v2.0 Optimizada)
+# ⚽ Club Atlético Puerto Marina - Sistema RAG Híbrido (v2.2)
 
 Sistema integral de **Generación Aumentada por Recuperación (RAG)** de grado productivo para la gestión operativa, biomédica, táctica y logística de un club de fútbol profesional.
 
@@ -6,21 +6,23 @@ Arquitectura optimizada basada en **SQLite Híbrido** (**FTS5** con ranking **BM
 
 ---
 
-## 🛠️ Novedades y Optimizaciones de la Versión 2.0
+## 🛠️ Novedades y Optimizaciones (v2.2)
 
-1. **Filtrado de *Stopwords* y Normalización de Diacríticos en Español para FTS5 (`src/retriever.py`):**
-   Elimina conectores vacíos (*"como"*, *"cual"*, *"para"*, *"los"*, *"del"*, etc.) y normaliza tildes antes de armar la consulta `MATCH` en SQLite FTS5. Esto previene falsos positivos y maximiza la precisión de BM25.
-2. **Búsqueda Vectorial en Dos Fases con Reducción Drástica de I/O (`src/retriever.py`):**
-   - **Fase 1:** Carga únicamente los pares `(id, embedding)` (blobs binarios compactos de 1.536 bytes) y ejecuta el producto punto matricial en BLAS/C.
-   - **Fase 2:** Recupera el texto completo y metadatos **únicamente de los fragmentos Top-K ganadores**.
-3. **Puente Relacional SQL-a-RAG (`src/ingestion.py`):**
-   Las tablas estructuradas `players` y `staff` se sincronizan automáticamente como documentos virtuales vectorizados. Permite consultar directamente datos de contacto, teléfonos, pesos, estaturas y dorsales.
-4. **Sintetizador Extractivo con Preservación de Tablas y Confianza Dinámica (`src/generator.py`):**
-   Reconstruye encabezados de tablas Markdown y calcula un índice de confianza dinámico según el acuerdo inter-modal (BM25 + Coseno).
-5. **Adaptador Universal para LLMs (`src/config.py` y `src/generator.py`):**
-   Funciona 100% de forma local/offline o se conecta a cualquier LLM compatible con OpenAI (Ollama, Groq, Gemini, OpenAI) configurando variables de entorno (`USE_EXTERNAL_LLM`, `LLM_API_BASE`, `LLM_API_KEY`, `LLM_MODEL`).
-6. **Suite Ampliada a 10 Pruebas Unitarias Automatizadas (`tests/test_rag.py`):**
-   Cobertura completa del motor híbrido, normalización, puente relacional y auditoría.
+1. **Filtrado de *Stopwords*, Normalización de Diacríticos y Términos Técnicos en FTS5 (`src/retriever.py`):**
+   Elimina conectores vacíos (*"como"*, *"cual"*, *"para"*, *"los"*, *"del"*, etc.) y normaliza tildes antes de armar la consulta `MATCH` con BM25 ponderado por columna, preservando siglas tácticas/métricas de 2 letras (`xG`, `xA`, `DT`, `AT`, `PF`, `ID`).
+2. **Búsqueda Vectorial en Dos Fases y Modos Puros (`src/retriever.py`):**
+   - **Fase 1:** Carga únicamente los pares `(id, embedding)` y ejecuta el producto punto matricial en BLAS/C.
+   - **Fase 2:** Hidrata texto y metadatos **únicamente de los Top-K ganadores**, respetando `alpha=1.0` (léxico puro) y `alpha=0.0` (semántico puro).
+3. **Chunking Consciente de Tablas y Limpieza de Huérfanos (`src/ingestion.py`):**
+   Fragmentación ajustada a la ventana de MiniLM (`900` chars / `180` overlap), preservando encabezados (`| col |` + `|---|`) al dividir tablas largas, evitando chunks huérfanos de solo títulos o separadores `---`, y limpiando documentos obsoletos al reindexar.
+4. **Puente Relacional SQL-a-RAG (`src/ingestion.py`):**
+   Las tablas estructuradas `players` y `staff` se sincronizan automáticamente como documentos virtuales fragmentados y vectorizados.
+5. **Sintetizador Extractivo Mejorado, Guardia Out-of-Domain y Telemetría (`src/generator.py`):**
+   Reconstruye múltiples tablas Markdown por fragmento, detecta consultas fuera de dominio (`insufficient_evidence`), protege prompts con delimitadores XML y reporta `fallback_used` / `fallback_reason`.
+6. **Adaptador Universal para LLMs (`src/config.py` y `src/generator.py`):**
+   Funciona 100% local/offline (`USE_EXTERNAL_LLM=false`) o conectado a Ollama (sin API key requerida), Groq, Gemini u OpenAI, con recarga segura de `.env`, backoff ante HTTP 429, auto-descubrimiento ante HTTP 404 y limpieza de bloques `<think>`.
+7. **Suite de 13 Pruebas Automatizadas Aisladas (`tests/test_rag.py`):**
+   Ejecución sobre base de datos y directorio temporal (`tempfile`) para no mutar la base productiva, cubriendo motor híbrido, chunking, LLM mockeado y seguridad/validación en FastAPI (`TestClient`).
 
 ---
 
@@ -99,48 +101,55 @@ Arquitectura optimizada basada en **SQLite Híbrido** (**FTS5** con ranking **BM
 
 ## 🚀 Instalación y Puesta en Marcha
 
-### 1. Dependencias
+### 1. Entorno Virtual y Dependencias
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
-### 2. Configuración Opcional (`.env`)
+### 2. Reindexación Inicial (opcional)
+La base `data/database/club_knowledge.db` ya viene pre-indexada y lista para usarse; si modificas o agregas documentos en `data/raw_documents/`, podés regenerarla ejecutando:
+```bash
+.venv/bin/python -m src.ingestion
+```
+
+### 3. Configuración Opcional (`.env`)
 Copiar plantilla de entorno:
 ```bash
 cp .env.example .env
 ```
 Por defecto, `USE_EXTERNAL_LLM=false` utiliza el sintetizador local extractivo de alto rendimiento (0 costo, 0 dependencias). Si deseas activar un LLM (Ollama, Groq, Gemini u OpenAI), edita `.env`.
 
-### 3. Iniciar el Servidor Web & API
+### 4. Iniciar el Servidor Web & API
 ```bash
 ./run_server.sh
 ```
 - **Consola Web:** [http://127.0.0.1:8000](http://127.0.0.1:8000)
 - **Documentación Swagger:** [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
-### 4. Consultas por Terminal (CLI)
+### 5. Consultas por Terminal (CLI)
 ```bash
 # Consulta puntual
-PYTHONPATH=. python src/cli.py --query "¿Cuál es la lesión de Lautaro Carrizo y cuándo vuelve a jugar?"
+.venv/bin/python -m src.cli --query "¿Cuál es la lesión de Lautaro Carrizo y cuándo vuelve a jugar?"
 
 # Consulta con filtro por departamento
-PYTHONPATH=. python src/cli.py --dept preparacion_fisica --query "¿Qué jugador tiene alerta de fatiga en el GPS?"
+.venv/bin/python -m src.cli --dept preparacion_fisica --query "¿Qué jugador tiene alerta de fatiga en el GPS?"
 
 # Consulta de datos relacionales indexados
-PYTHONPATH=. python src/cli.py --query "¿Cuál es el correo y teléfono de la nutricionista Sofía Carrizo?"
+.venv/bin/python -m src.cli --query "¿Cuál es el correo y teléfono de la nutricionista Sofía Carrizo?"
 
 # Estadísticas del sistema
-PYTHONPATH=. python src/cli.py --stats
+.venv/bin/python -m src.cli --stats
 
 # Modo interactivo
-PYTHONPATH=. python src/cli.py --interactive
+.venv/bin/python -m src.cli --interactive
 ```
 
-### 5. Suite de Pruebas Automatizadas
+### 6. Suite de Pruebas Automatizadas
 ```bash
-PYTHONPATH=. python tests/test_rag.py
+.venv/bin/pytest -v tests/test_rag.py
 ```
-*(10 pruebas unitarias que validan esquema, FTS5 BM25, embeddings, 2-phase vector search, RRF, filtros departamentales, puente SQL-RAG y telemetría).*
+*(13 pruebas unitarias e integración aisladas que validan esquema, FTS5 BM25, términos técnicos cortos, embeddings, 2-phase vector search, RRF, modos puros alpha 0/1, chunking con preservación de tablas, puente SQL-RAG, LLM mockeado y endpoints/seguridad en FastAPI).*
 
 ---
 
@@ -148,12 +157,16 @@ PYTHONPATH=. python tests/test_rag.py
 
 | Método | Endpoint | Descripción |
 |---|---|---|
-| `GET` | `/api/status` | Estado del sistema, recuentos de documentos, chunks, estado del LLM y latencias |
-| `POST` | `/api/query` | Ejecución de consulta RAG híbrida con citas, fragmentos y confianza dinámica |
+| `GET` | `/health` | Healthcheck liviano para monitoreo / readiness |
+| `GET` | `/api/status` | Estado del sistema, recuentos de documentos, chunks, modo de síntesis y latencias |
+| `GET` | `/api/llm/health` | Verificación en vivo de conectividad y modelos disponibles en el proveedor LLM |
+| `POST` | `/api/query` | Ejecución de consulta RAG híbrida con citas, confianza dinámica y telemetría de fallback |
+| `POST` | `/api/reindex` | Reindexación completa de documentos Markdown y tablas SQL con limpieza de huérfanos |
 | `GET` | `/api/documents` | Listado de documentos y desglose por departamento |
 | `GET` | `/api/documents/{id}` | Contenido completo de un documento y sus chunks |
-| `POST` | `/api/documents` | Ingesta dinámica de nuevos partes o reportes en tiempo real |
+| `POST` | `/api/documents` | Ingesta dinámica segura de nuevos partes o reportes en tiempo real |
+| `DELETE` | `/api/documents/{id}` | Eliminación de documento del índice y disco (protege documentos virtuales SQL) |
 | `GET` | `/api/players` | Fichas biomédicas y técnicas del plantel profesional |
 | `GET` | `/api/staff` | Directorio de cuerpo técnico y especialistas |
 | `GET` | `/api/departments` | Catálogo de departamentos operativos |
-| `GET` | `/api/logs` | Auditoría de consultas ejecutadas con telemetría de milisegundos |
+| `GET` | `/api/logs` | Auditoría de consultas ejecutadas con telemetría de milisegundos (`limit` 1..200) |

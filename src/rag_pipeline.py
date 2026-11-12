@@ -1,11 +1,11 @@
 """
-End-to-end RAG Pipeline orchestrator for Club Atlético Puerto Marina (v2.0).
+End-to-end RAG Pipeline orchestrator for Club Atlético Puerto Marina (v2.2).
 Coordinates hybrid retrieval, grounded generation, and SQLite audit logging.
 """
 import time
 from typing import Dict, Any, Optional
 
-from src.config import DB_PATH, DEFAULT_TOP_K, DEFAULT_HYBRID_ALPHA, USE_EXTERNAL_LLM, LLM_MODEL, LLM_API_KEY
+from src.config import DB_PATH, DEFAULT_TOP_K, DEFAULT_HYBRID_ALPHA
 from src.database import get_db_connection
 from src.retriever import HybridRetriever
 from src.generator import GroundedGenerator
@@ -61,6 +61,8 @@ class ClubRAGPipeline:
             "citations": gen_output["citations"],
             "confidence": gen_output["confidence"],
             "model_used": gen_output["model_used"],
+            "fallback_used": gen_output.get("fallback_used", False),
+            "fallback_reason": gen_output.get("fallback_reason"),
             "retrieved_chunks": results,
             "timings": {
                 "retrieval_ms": retrieval_time_ms,
@@ -79,6 +81,7 @@ class ClubRAGPipeline:
         retrieval_ms: float,
         total_ms: float
     ) -> None:
+        conn = None
         try:
             conn = get_db_connection(self.db_path)
             conn.execute("""
@@ -89,35 +92,38 @@ class ClubRAGPipeline:
                 VALUES (?, ?, ?, ?, ?, ?, ?);
             """, (query, dept_filter, chunk_count, top_sim, response[:1000], retrieval_ms, total_ms))
             conn.commit()
-            conn.close()
         except Exception as e:
             print(f"Warning: could not write to query_logs ({e})")
+        finally:
+            if conn is not None:
+                conn.close()
 
     def get_stats(self) -> Dict[str, Any]:
         conn = get_db_connection(self.db_path)
-        cur = conn.cursor()
+        try:
+            cur = conn.cursor()
 
-        docs_count = cur.execute("SELECT count(*) FROM documents").fetchone()[0]
-        chunks_count = cur.execute("SELECT count(*) FROM chunks").fetchone()[0]
-        players_count = cur.execute("SELECT count(*) FROM players").fetchone()[0]
-        staff_count = cur.execute("SELECT count(*) FROM staff").fetchone()[0]
-        dept_count = cur.execute("SELECT count(*) FROM departments").fetchone()[0]
-        queries_count = cur.execute("SELECT count(*) FROM query_logs").fetchone()[0]
+            docs_count = cur.execute("SELECT count(*) FROM documents").fetchone()[0]
+            chunks_count = cur.execute("SELECT count(*) FROM chunks").fetchone()[0]
+            players_count = cur.execute("SELECT count(*) FROM players").fetchone()[0]
+            staff_count = cur.execute("SELECT count(*) FROM staff").fetchone()[0]
+            dept_count = cur.execute("SELECT count(*) FROM departments").fetchone()[0]
+            queries_count = cur.execute("SELECT count(*) FROM query_logs").fetchone()[0]
 
-        avg_latency_row = cur.execute("SELECT avg(total_ms) FROM query_logs").fetchone()[0]
-        avg_latency = round(avg_latency_row, 2) if avg_latency_row else 0.0
+            avg_latency_row = cur.execute("SELECT avg(total_ms) FROM query_logs").fetchone()[0]
+            avg_latency = round(avg_latency_row, 2) if avg_latency_row else 0.0
 
-        dept_docs = cur.execute("""
-            SELECT d.id, d.name, count(doc.id) as doc_count
-            FROM departments d
-            LEFT JOIN documents doc ON doc.department_id = d.id
-            GROUP BY d.id
-        """).fetchall()
-
-        conn.close()
+            dept_docs = cur.execute("""
+                SELECT d.id, d.name, count(doc.id) as doc_count
+                FROM departments d
+                LEFT JOIN documents doc ON doc.department_id = d.id
+                GROUP BY d.id
+            """).fetchall()
+        finally:
+            conn.close()
 
         self.generator._refresh_config_if_needed()
-        llm_active = self.generator.use_llm and bool(self.generator.api_key)
+        llm_active = self.generator.is_llm_active()
         return {
             "documents_count": docs_count,
             "chunks_count": chunks_count,
@@ -130,3 +136,4 @@ class ClubRAGPipeline:
             "llm_api_base": self.generator.api_base if llm_active else None,
             "departments": [dict(r) for r in dept_docs]
         }
+

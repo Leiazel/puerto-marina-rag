@@ -3,6 +3,7 @@ Embedding module using FastEmbed multilingual ONNX runtime.
 Supports batch embedding, BLOB serialization, and vectorized cosine similarity.
 """
 import os
+import threading
 import numpy as np
 from typing import List
 from src.config import EMBEDDING_MODEL_NAME, EMBEDDING_DIM
@@ -17,11 +18,14 @@ from fastembed import TextEmbedding
 
 class EmbeddingEngine:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(EmbeddingEngine, cls).__new__(cls)
-            cls._instance._init_model()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(EmbeddingEngine, cls).__new__(cls)
+                    cls._instance._init_model()
         return cls._instance
 
     def _init_model(self):
@@ -31,7 +35,7 @@ class EmbeddingEngine:
 
     def embed_text(self, text: str) -> np.ndarray:
         """Embeds a single text into a unit-normalized float32 1D numpy array."""
-        clean_text = text.strip() if text else " "
+        clean_text = text.strip() if text and text.strip() else " "
         embeddings = list(self.model.embed([clean_text]))
         vec = np.array(embeddings[0], dtype=np.float32)
         norm = np.linalg.norm(vec)
@@ -41,6 +45,8 @@ class EmbeddingEngine:
 
     def embed_batch(self, texts: List[str], batch_size: int = 32) -> List[np.ndarray]:
         """Embeds a batch of texts into unit-normalized float32 arrays."""
+        if not texts:
+            return []
         clean_texts = [t.strip() if t and t.strip() else " " for t in texts]
         embeddings = list(self.model.embed(clean_texts, batch_size=batch_size))
         normalized = []
@@ -51,6 +57,7 @@ class EmbeddingEngine:
                 vec = vec / norm
             normalized.append(vec)
         return normalized
+
 
     @staticmethod
     def vector_to_blob(vec: np.ndarray) -> bytes:

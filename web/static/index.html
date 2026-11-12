@@ -33,12 +33,15 @@
   <!-- Main Content -->
   <main>
 
+    <!-- Notification Banner -->
+    <div id="app-banner" class="app-banner" role="alert" style="display: none;"></div>
+
     <!-- Stats Ribbon -->
     <div class="stats-ribbon">
       <div class="stat-card">
         <span class="stat-label">Documentos Oficiales</span>
         <span class="stat-val" id="stat-docs">-</span>
-        <span class="stat-sub">7 departamentos operativos</span>
+        <span class="stat-sub" id="stat-depts-sub">- departamentos operativos</span>
       </div>
       <div class="stat-card">
         <span class="stat-label">Fragmentos (Chunks)</span>
@@ -48,12 +51,18 @@
       <div class="stat-card">
         <span class="stat-label">Plantel Profesional</span>
         <span class="stat-val" id="stat-players">-</span>
-        <span class="stat-sub">14 perfiles biomédicos</span>
+        <span class="stat-sub" id="stat-players-sub">- perfiles biomédicos</span>
       </div>
       <div class="stat-card">
         <span class="stat-label">Latencia RAG Promedio</span>
         <span class="stat-val" id="stat-latency">-</span>
         <span class="stat-sub" id="stat-mode">Búsqueda Híbrida RRF</span>
+        <div class="stat-actions">
+          <span class="badge badge-info" id="llm-health-badge">LLM: verificando...</span>
+          <button type="button" id="reindex-btn" class="mini-action-btn" title="Reindexar archivos Markdown y tablas SQL">
+            🔄 Reindexar
+          </button>
+        </div>
       </div>
     </div>
 
@@ -68,7 +77,7 @@
             placeholder="Pregunta sobre partes médicos, GPS Catapult, táctica, nutrición o logística..." 
             autocomplete="off"
           />
-          <button id="submit-btn" class="query-submit-btn" onclick="executeQuery()">
+          <button type="button" id="submit-btn" class="query-submit-btn">
             <span>⚡</span> Consultar RAG
           </button>
         </div>
@@ -108,27 +117,27 @@
 
         <!-- Suggestion Chips -->
         <div class="suggestions-chips">
-          <span class="suggestion-chip" onclick="executeQuery('¿Cuál es la situación médica de Lautaro Carrizo y cuándo puede volver a jugar?')">
+          <button type="button" class="suggestion-chip" data-query="¿Cuál es la situación médica de Lautaro Carrizo y cuándo puede volver a jugar?">
             🩹 Lesión de Lautaro Carrizo
-          </span>
-          <span class="suggestion-chip" onclick="executeQuery('¿Qué jugador tiene alerta de sobrecarga física según el reporte GPS Catapult?')">
+          </button>
+          <button type="button" class="suggestion-chip" data-query="¿Qué jugador tiene alerta de sobrecarga física según el reporte GPS Catapult?">
             ⚡ Alerta GPS y Fatiga
-          </span>
-          <span class="suggestion-chip" onclick="executeQuery('¿Quién es celíaco en el plantel y qué menú especial Sin TACC requiere?')">
+          </button>
+          <button type="button" class="suggestion-chip" data-query="¿Quién es celíaco en el plantel y qué menú especial Sin TACC requiere?">
             🥗 Dieta Celíaca (Agustín Ríos)
-          </span>
-          <span class="suggestion-chip" onclick="executeQuery('¿Cuál es el análisis táctico y las debilidades del rival Deportivo Los Andes?')">
+          </button>
+          <button type="button" class="suggestion-chip" data-query="¿Cuál es el análisis táctico y las debilidades del rival Deportivo Los Andes?">
             📋 Scouting de Los Andes
-          </span>
-          <span class="suggestion-chip" onclick="executeQuery('¿Cuáles son las multas por llegar tarde o sobrepeso según el reglamento interno?')">
+          </button>
+          <button type="button" class="suggestion-chip" data-query="¿Cuáles son las multas por llegar tarde o sobrepeso según el reglamento interno?">
             ⚖️ Multas y Convivencia
-          </span>
-          <span class="suggestion-chip" onclick="executeQuery('¿En qué hotel y en qué habitaciones se alojará el equipo para la semifinal?')">
+          </button>
+          <button type="button" class="suggestion-chip" data-query="¿En qué hotel y en qué habitaciones se aloja la delegación para la semifinal?">
             🏨 Hotel e Itinerario de Viaje
-          </span>
-          <span class="suggestion-chip" onclick="executeQuery('¿Qué evaluación tiene el volante sub-21 Rodrigo Chelo Vargas para fichajes?')">
+          </button>
+          <button type="button" class="suggestion-chip" data-query="¿Qué evaluación tiene el volante sub-21 Rodrigo Chelo Vargas para fichajes?">
             🔭 Scouting Rodrigo Vargas
-          </span>
+          </button>
         </div>
       </div>
 
@@ -139,6 +148,7 @@
           <div id="telemetry-badges" class="telemetry-badges"></div>
         </div>
 
+        <div id="fallback-notice" class="fallback-notice" style="display: none;"></div>
         <div id="answer-content" class="answer-body"></div>
 
         <!-- Chunks Accordion -->
@@ -165,7 +175,7 @@
     <section id="tab-docs" class="tab-pane">
       <div style="margin-bottom: 1.5rem;">
         <h2 style="font-size: 1.3rem; color: #fff;">Archivo Documental del Club</h2>
-        <p style="color: var(--text-muted); font-size: 0.85rem;">Documentos indexados en SQLite con partición de fragmentos y vectores FastEmbed.</p>
+        <p style="color: var(--text-muted); font-size: 0.85rem;">Documentos indexados en SQLite con partición de fragmentos y vectores FastEmbed. Haz clic en "Ver" para inspeccionar el contenido y sus chunks.</p>
       </div>
       <div class="data-table-container">
         <table class="data-table">
@@ -177,6 +187,7 @@
               <th>Autor</th>
               <th>Fecha</th>
               <th>Chunks</th>
+              <th>Acciones</th>
             </tr>
           </thead>
           <tbody id="docs-table-body"></tbody>
@@ -202,10 +213,10 @@
         </p>
 
         <form id="ingest-form">
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+          <div class="form-row-2col">
             <div class="form-group">
               <label class="form-label" for="ingest-code">Código Único (Ej: MED-2026-11-08-01):</label>
-              <input type="text" id="ingest-code" class="form-input" required placeholder="MED-2026-11-08-01">
+              <input type="text" id="ingest-code" class="form-input" required pattern="[A-Za-z0-9_-]{3,80}" title="Solo letras, números, '-' y '_' (3 a 80 caracteres)" placeholder="MED-2026-11-08-01">
             </div>
             <div class="form-group">
               <label class="form-label" for="ingest-dept">Departamento Responsable:</label>
@@ -226,14 +237,14 @@
             <input type="text" id="ingest-title" class="form-input" required placeholder="Parte Médico Post-Partido Semifinal">
           </div>
 
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+          <div class="form-row-2col">
             <div class="form-group">
               <label class="form-label" for="ingest-author">Autor / Especialista:</label>
               <input type="text" id="ingest-author" class="form-input" required placeholder="Dr. Federico Arismendi">
             </div>
             <div class="form-group">
               <label class="form-label" for="ingest-date">Fecha de Emisión:</label>
-              <input type="date" id="ingest-date" class="form-input" value="2026-11-08" required>
+              <input type="date" id="ingest-date" class="form-input" required>
             </div>
           </div>
 
@@ -279,6 +290,25 @@
 
   </main>
 
+  <!-- Document Detail Modal -->
+  <div id="doc-modal" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="modal-doc-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div>
+          <h3 id="modal-doc-title" style="color: #fff; font-size: 1.15rem;">Documento</h3>
+          <div id="modal-doc-meta" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;"></div>
+        </div>
+        <button type="button" id="modal-close-btn" class="mini-action-btn">✕ Cerrar</button>
+      </div>
+      <div class="modal-body">
+        <h4 style="color: var(--gold-accent); margin-bottom: 0.5rem;">Contenido Original</h4>
+        <div id="modal-doc-content" class="answer-body modal-content-box"></div>
+        <h4 style="color: #38bdf8; margin: 1.25rem 0 0.5rem 0;">Fragmentos Indexados (Chunks)</h4>
+        <div id="modal-doc-chunks"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Footer -->
   <footer>
     Club Atlético Puerto Marina • Sistema RAG de Alto Rendimiento • Motor SQLite Híbrido (FTS5 BM25 + FastEmbed Multilingual ONNX + RRF Fusion)
@@ -287,3 +317,4 @@
   <script src="/static/app.js"></script>
 </body>
 </html>
+

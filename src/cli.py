@@ -1,5 +1,5 @@
 """
-Interactive CLI for Club Atlético Puerto Marina RAG System.
+Interactive CLI for Club Atlético Puerto Marina RAG System (v2.2).
 Allows instant queries, interactive terminal sessions, stats inspection, and re-indexing.
 """
 import sys
@@ -11,8 +11,25 @@ root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
+from src.config import DB_PATH
 from src.rag_pipeline import ClubRAGPipeline
 from src.ingestion import run_full_ingestion
+
+DEPT_PREFIX_MAP = {
+    "medico": "servicio_medico",
+    "servicio_medico": "servicio_medico",
+    "gps": "preparacion_fisica",
+    "preparacion_fisica": "preparacion_fisica",
+    "tactica": "cuerpo_tecnico",
+    "cuerpo_tecnico": "cuerpo_tecnico",
+    "nutricion": "nutricion",
+    "scouting": "scouting",
+    "logistica": "logistica_viajes",
+    "logistica_viajes": "logistica_viajes",
+    "prensa": "disciplina_prensa",
+    "disciplina_prensa": "disciplina_prensa",
+}
+VALID_DEPARTMENTS = set(DEPT_PREFIX_MAP.values())
 
 
 def print_banner():
@@ -27,6 +44,9 @@ def display_result(result):
     print(f"🔎 CONSULTA: {result['query']}")
     if result.get("department_filter"):
         print(f"🏢 FILTRO ÁREA: {result['department_filter']}")
+    print(f"🧠 MOTOR: {result.get('model_used', 'local')} | 🎯 CONFIANZA: {int(result.get('confidence', 0) * 100)}%")
+    if result.get("fallback_used"):
+        print(f"⚠️  FALLBACK ACTIVO: {result.get('fallback_reason')}")
     print(f"⏱️  TIEMPO TOTAL: {result['timings']['total_ms']} ms "
           f"(Búsqueda: {result['timings']['retrieval_ms']} ms | Síntesis: {result['timings']['generation_ms']} ms)")
     print("=" * 70 + "\n")
@@ -46,15 +66,21 @@ def display_result(result):
     print("=" * 70 + "\n")
 
 
+def _ensure_db_initialized():
+    if not DB_PATH.exists():
+        print("⚙️  Base de datos no encontrada. Ejecutando ingesta inicial...")
+        run_full_ingestion()
+
+
 def interactive_mode(pipeline):
     print_banner()
     print("Modo interactivo iniciado. Escribe tu pregunta (o 'salir' para terminar):")
     print("Ejemplos:")
     print("  - ¿Cuál es la evolución de la lesión de Lautaro Carrizo y cuándo puede jugar?")
     print("  - ¿Qué jugador tiene riesgo de sobrecarga según el reporte de GPS Catapult?")
-    print("  - ¿Quién es celíaco y qué menú especial requiere en el hotel?")
-    print("  - ¿Cuáles son las multas por llegar tarde al entrenamiento o por sobrepeso?")
-    print("  - ¿Cuál es el análisis táctico y las debilidades del rival Deportivo Los Andes?")
+    print("  - nutricion: ¿Quién es celíaco y qué menú especial requiere en el hotel?")
+    print("  - logistica: ¿En qué hotel se concentra el plantel?")
+    print("  - prensa: ¿Cuáles son las multas por llegar tarde al entrenamiento?")
     print("-" * 70)
 
     while True:
@@ -65,20 +91,18 @@ def interactive_mode(pipeline):
             if q.lower() in ["salir", "exit", "quit", "q"]:
                 print("Cerrando sesión. ¡Vamos Puerto Marina!")
                 break
-            
+
             # Check for department filter syntax: e.g. "medico: ¿como esta carrizo?"
             dept_filter = None
-            if ":" in q and q.split(":", 1)[0].lower() in ["medico", "servicio_medico", "gps", "preparacion_fisica", "tactica", "cuerpo_tecnico", "nutricion", "scouting", "logistica", "prensa"]:
-                tag, actual_q = q.split(":", 1)
-                mapping = {
-                    "medico": "servicio_medico", "servicio_medico": "servicio_medico",
-                    "gps": "preparacion_fisica", "preparacion_fisica": "preparacion_fisica",
-                    "tactica": "cuerpo_tecnico", "cuerpo_tecnico": "cuerpo_tecnico",
-                    "nutricion": "nutricion", "scouting": "scouting",
-                    "logistica": "logistica_viajes", "prensa": "disciplina_prensa"
-                }
-                dept_filter = mapping.get(tag.strip().lower())
-                q = actual_q.strip()
+            if ":" in q:
+                prefix, rest = q.split(":", 1)
+                mapped = DEPT_PREFIX_MAP.get(prefix.strip().lower())
+                if mapped:
+                    dept_filter = mapped
+                    q = rest.strip()
+                    if not q:
+                        print("⚠️  Escribe una consulta después del prefijo de departamento.")
+                        continue
 
             result = pipeline.ask(q, department_filter=dept_filter)
             display_result(result)
@@ -91,7 +115,7 @@ def main():
     parser = argparse.ArgumentParser(description="CLI de RAG para Club Atlético Puerto Marina")
     parser.add_argument("--query", "-q", type=str, help="Ejecutar una consulta directa")
     parser.add_argument("--dept", "-d", type=str, default=None, help="Filtrar por departamento (ej: servicio_medico, cuerpo_tecnico)")
-    parser.add_argument("--top_k", "-k", type=int, default=4, help="Número de fragmentos a recuperar (default: 4)")
+    parser.add_argument("--top_k", "-k", type=int, default=4, help="Número de fragmentos a recuperar (1-15, default: 4)")
     parser.add_argument("--alpha", "-a", type=float, default=0.5, help="Peso híbrido RRF: 0=vector, 1=lexical (default: 0.5)")
     parser.add_argument("--interactive", "-i", action="store_true", help="Iniciar sesión interactiva")
     parser.add_argument("--stats", "-s", action="store_true", help="Mostrar estadísticas de la base de datos")
@@ -99,17 +123,26 @@ def main():
 
     args = parser.parse_args()
 
+    if not (0.0 <= args.alpha <= 1.0):
+        parser.error("--alpha debe estar entre 0.0 y 1.0")
+    if not (1 <= args.top_k <= 15):
+        parser.error("--top_k debe estar entre 1 y 15")
+    if args.dept and args.dept not in VALID_DEPARTMENTS:
+        parser.error(f"--dept inválido '{args.dept}'. Opciones: {', '.join(sorted(VALID_DEPARTMENTS))}")
+
     if args.reindex:
         print_banner()
         run_full_ingestion()
         return
 
+    _ensure_db_initialized()
     pipeline = ClubRAGPipeline()
 
     if args.stats:
         print_banner()
         stats = pipeline.get_stats()
         print("\n📊 ESTADÍSTICAS DEL SISTEMA:")
+        print(f" - Motor de síntesis activo:        {stats['synthesis_mode']}")
         print(f" - Documentos operativos indexados: {stats['documents_count']}")
         print(f" - Fragmentos (chunks) en SQLite:   {stats['chunks_count']}")
         print(f" - Futbolistas registrados:         {stats['players_count']}")
@@ -123,8 +156,10 @@ def main():
         print("=" * 70)
         return
 
-    if args.query:
-        result = pipeline.ask(args.query, department_filter=args.dept, top_k=args.top_k, alpha=args.alpha)
+    if args.query is not None:
+        if not args.query.strip():
+            parser.error("--query no puede estar vacío")
+        result = pipeline.ask(args.query.strip(), department_filter=args.dept, top_k=args.top_k, alpha=args.alpha)
         display_result(result)
         return
 
@@ -134,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
